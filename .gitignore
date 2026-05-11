@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+.venv*
+venv/
+
+# Spatial Data
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.geojson
+*.json
+
+# Results / Output
+Results_*/
+V4_metrics/
+runs/
+*.zip
+
+# Models
+*.pt
+*.engine
+*.onnx
+
+# Node
+node_modules/
+.npm
+frontend/.next/
+frontend/out/
+
+# IDEs
+.vscode/
+.idea/

@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+ultralytics
+torch
+torchvision
+opencv-python
+pandas
+geopandas
+shapely
+openpyxl
+tqdm
+laspy
+scipy
+pyproj
