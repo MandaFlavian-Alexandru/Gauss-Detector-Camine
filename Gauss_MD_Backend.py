@@ -591,6 +591,7 @@ def _predict_with_tiles(
     origins = _generate_tile_origins(w, h, tile, cfg.tile_overlap)
 
     all_boxes: list[list[float]] = []  # rows of [x1, y1, x2, y2, conf]
+    crops = []
 
     for x0, y0 in origins:
         x1 = min(x0 + tile, w)
@@ -605,27 +606,34 @@ def _predict_with_tiles(
         pw = tile - crop.shape[1]
         if ph > 0 or pw > 0:
             crop = cv2.copyMakeBorder(crop, 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
+            
+        crops.append(crop)
 
-        results = model.predict(
-            source=crop,
-            conf=cfg.base_conf,        # very low — we want every candidate
-            iou=cfg.iou_threshold,
-            imgsz=tile,                 # tile is already the right size, no resize
-            augment=cfg.use_tta,
-            half=use_half,
-            device=device,
-            verbose=False,
-        )
+    if not crops:
+        return []
 
-        for r in results:
-            for box in r.boxes:
-                bx1, by1, bx2, by2 = box.xyxy[0].tolist()
-                # convert from tile-local coords back to full-image coords
-                all_boxes.append([
-                    bx1 + x0, by1 + y0,
-                    bx2 + x0, by2 + y0,
-                    float(box.conf[0]),
-                ])
+    # Run inference on all tiles in a single batched call to push the GPU
+    results = model.predict(
+        source=crops,
+        batch=cfg.batch_size,      # use the configured batch size
+        conf=cfg.base_conf,        # very low — we want every candidate
+        iou=cfg.iou_threshold,
+        imgsz=tile,                # tile is already the right size, no resize
+        augment=cfg.use_tta,
+        half=use_half,
+        device=device,
+        verbose=False,
+    )
+
+    for r, (x0, y0) in zip(results, origins):
+        for box in r.boxes:
+            bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+            # convert from tile-local coords back to full-image coords
+            all_boxes.append([
+                bx1 + x0, by1 + y0,
+                bx2 + x0, by2 + y0,
+                float(box.conf[0]),
+            ])
 
     if not all_boxes:
         return []
