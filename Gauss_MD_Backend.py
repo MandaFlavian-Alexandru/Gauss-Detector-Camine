@@ -571,101 +571,99 @@ def _generate_tile_origins(image_w: int, image_h: int, tile: int, overlap: float
     return [(x, y) for y in ys for x in xs]
 
 
-def _predict_with_tiles(
+def _predict_with_tiles_batch(
     model:     YOLO,
-    img:       np.ndarray,
+    imgs:      list[np.ndarray],
     cfg:       PipelineConfig,
     device:    str,
     use_half:  bool,
-) -> list[dict]:
+) -> list[list[dict]]:
     """
-    Tile-based YOLO inference. Slices the image into overlapping 640x640
-    tiles (matching YOLOv8's native training resolution), runs detection on
-    each tile, then merges the results back to the full image coordinate
-    space and applies NMS to clean up duplicates along the seams.
-
-    This is what makes detection work despite the domain shift between
-    dashcam training data and ladybug deployment imagery. Each tile is
-    fed to the model at its native resolution with no letterbox squashing,
-    so small manholes keep their actual pixel size. Each tile is also a
-    small enough region that local fisheye curvature is minimal.
-
-    Returns: list of {'xyxy': [x1, y1, x2, y2], 'conf': float}, where
-    coordinates are in the original image's pixel space.
+    Batched Tile-based YOLO inference. Slices multiple images into overlapping 
+    640x640 tiles, runs detection on all tiles in a single massive GPU call, 
+    then merges the results back to each respective image's coordinate space.
     """
-    h, w = img.shape[:2]
-    tile = cfg.tile_size
-
-    origins = _generate_tile_origins(w, h, tile, cfg.tile_overlap)
-
-    all_boxes: list[list[float]] = []  # rows of [x1, y1, x2, y2, conf]
-    crops = []
-
-    for x0, y0 in origins:
-        x1 = min(x0 + tile, w)
-        y1 = min(y0 + tile, h)
-        crop = img[y0:y1, x0:x1]
-
-        # if the tile is smaller than the requested size (because we're at
-        # the edge of the image), pad it with reflected pixels so YOLO gets
-        # a clean square. reflection is better than black padding — black
-        # creates artificial edges that confuse the detector.
-        ph = tile - crop.shape[0]
-        pw = tile - crop.shape[1]
-        if ph > 0 or pw > 0:
-            crop = cv2.copyMakeBorder(crop, 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
-            
-        crops.append(crop)
-
-    if not crops:
+    if not imgs:
         return []
 
-    # Run inference on all tiles in a single batched call to push the GPU
+    h, w = imgs[0].shape[:2]
+    tile = cfg.tile_size
+    origins = _generate_tile_origins(w, h, tile, cfg.tile_overlap)
+
+    crops = []
+    tile_to_img_idx = []
+
+    for img_idx, img in enumerate(imgs):
+        for x0, y0 in origins:
+            x1 = min(x0 + tile, w)
+            y1 = min(y0 + tile, h)
+            crop = img[y0:y1, x0:x1]
+
+            ph = tile - crop.shape[0]
+            pw = tile - crop.shape[1]
+            if ph > 0 or pw > 0:
+                crop = cv2.copyMakeBorder(crop, 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
+                
+            crops.append(crop)
+            tile_to_img_idx.append((img_idx, x0, y0))
+
+    if not crops:
+        return [[] for _ in imgs]
+
+    # Run inference on ALL tiles from ALL images in a single batched call
     results = model.predict(
         source=crops,
-        batch=cfg.batch_size,      # use the configured batch size
-        conf=cfg.base_conf,        # very low — we want every candidate
+        batch=cfg.batch_size,      # pushes the GPU properly
+        conf=cfg.base_conf,
         iou=cfg.iou_threshold,
-        imgsz=tile,                # tile is already the right size, no resize
+        imgsz=tile,
         augment=cfg.use_tta,
         half=use_half,
         device=device,
-        workers=0,                 # force single-threaded data loading
+        workers=0,                 # single-threaded loader to save CPU
         verbose=False,
     )
 
-    for r, (x0, y0) in zip(results, origins):
+    all_boxes_per_img = [[] for _ in imgs]
+
+    for r, (img_idx, x0, y0) in zip(results, tile_to_img_idx):
         for box in r.boxes:
             bx1, by1, bx2, by2 = box.xyxy[0].tolist()
-            # convert from tile-local coords back to full-image coords
-            all_boxes.append([
+            all_boxes_per_img[img_idx].append([
                 bx1 + x0, by1 + y0,
                 bx2 + x0, by2 + y0,
                 float(box.conf[0]),
             ])
 
-    if not all_boxes:
-        return []
+    final_detections_per_img = []
 
-    # NMS across all tiles to dedupe boxes that landed in the overlap zones
-    arr   = np.array(all_boxes, dtype=np.float64)
-    boxes = arr[:, :4].tolist()
-    scores = arr[:, 4].tolist()
-    keep  = cv2.dnn.NMSBoxes(
-        bboxes=boxes,
-        scores=scores,
-        score_threshold=cfg.base_conf,
-        nms_threshold=cfg.iou_threshold,
-    )
-    if len(keep) == 0:
-        return []
-    keep = np.array(keep).flatten()
-    kept = arr[keep]
+    for img_boxes in all_boxes_per_img:
+        if not img_boxes:
+            final_detections_per_img.append([])
+            continue
 
-    return [
-        {"xyxy": [float(v) for v in row[:4]], "conf": float(row[4])}
-        for row in kept
-    ]
+        arr   = np.array(img_boxes, dtype=np.float64)
+        boxes = arr[:, :4].tolist()
+        scores = arr[:, 4].tolist()
+        keep  = cv2.dnn.NMSBoxes(
+            bboxes=boxes,
+            scores=scores,
+            score_threshold=cfg.base_conf,
+            nms_threshold=cfg.iou_threshold,
+        )
+        if len(keep) == 0:
+            final_detections_per_img.append([])
+            continue
+            
+        keep = np.array(keep).flatten()
+        kept = arr[keep]
+
+        final_detections_per_img.append([
+            {"xyxy": [float(v) for v in row[:4]], "conf": float(row[4])}
+            for row in kept
+        ])
+
+    return final_detections_per_img
 
 
 def euclidean_distance(x1, y1, x2, y2) -> float:
@@ -840,100 +838,136 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         n_raw_total    = 0   # detections found at base_conf, before final threshold
         n_after_filter = 0   # detections that survived the final cfg.confidence filter
 
-        for img_file in tqdm(images, desc=f"Scanning {cam_key}", unit="img"):
+        # We want to process images in chunks.
+        # Since each image produces 6 tiles, chunk_size = max(1, cfg.batch_size // 6)
+        chunk_size = max(1, cfg.batch_size // 6)
+
+        img_chunk_files = []
+        img_chunk_data = []
+        img_chunk_offsets = []
+
+        def process_chunk(files, img_data_list, offsets):
+            nonlocal n_det, n_raw_total, n_after_filter, all_detections, heading_check_sample
+
+            if cfg.use_tiled_inference:
+                batch_detections = _predict_with_tiles_batch(
+                    model, img_data_list, cfg, device, use_half
+                )
+            else:
+                # legacy single-shot inference on the full images
+                results = model.predict(
+                    source=img_data_list, batch=cfg.batch_size, conf=cfg.base_conf, iou=cfg.iou_threshold,
+                    imgsz=cfg.image_width, augment=cfg.use_tta, half=use_half,
+                    device=device, workers=0, verbose=False,
+                )
+                batch_detections = []
+                for r in results:
+                    dets = []
+                    for box in r.boxes:
+                        bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                        dets.append({
+                            "xyxy": [bx1, by1, bx2, by2],
+                            "conf": float(box.conf[0]),
+                        })
+                    batch_detections.append(dets)
+
+            for idx, file_name in enumerate(files):
+                detections = batch_detections[idx]
+                y_offset = offsets[idx]
+                
+                n_raw_total += len(detections)
+                detections = [d for d in detections if d["conf"] >= cfg.confidence]
+                n_after_filter += len(detections)
+
+                if not detections:
+                    continue
+
+                telemetry = lookup.get(file_name.strip().lower())
+                car_x = float(telemetry["X_Stereo70"])
+                car_y = float(telemetry["Y_Stereo70"])
+                car_z = float(telemetry["Z"])
+                car_h = float(telemetry["Heading_deg"])
+
+                for det in detections:
+                    x1, y1, x2, y2 = det["xyxy"]
+                    y1 += y_offset
+                    y2 += y_offset
+                    conf = det["conf"]
+                    bbox_cx = (x1 + x2) / 2.0
+                    bbox_cy = (y1 + y2) / 2.0
+
+                    geo = calculate_gps_offset_3d(
+                        car_x, car_y, car_z, car_h,
+                        bbox_cx, bbox_cy, mount_ang,
+                        kdtree, points, cfg, geoid_undulation,
+                    )
+
+                    if geo["x"] is None:
+                        continue
+
+                    det_record = {
+                        "image":        file_name,
+                        "cam_key":      cam_key,
+                        "folder_path":  folder_path,
+                        "x1": int(x1), "y1": int(y1),
+                        "x2": int(x2), "y2": int(y2),
+                        "conf":         conf,
+                        "x":            geo["x"],
+                        "y":            geo["y"],
+                        "z":            geo["z"],
+                        "lidar_hit":    geo["lidar_hit"],
+                        "px_edge_flag": geo["px_edge_flag"],
+                        "range_m":      geo["range_m"],
+                        "_car_heading_deg":  car_h,
+                        "true_heading_deg":  geo["true_heading_deg"],
+                    }
+                    all_detections.append(det_record)
+                    n_det += 1
+
+                    if len(heading_check_sample) < 5:
+                        heading_check_sample.append(det_record)
+
+        pbar = tqdm(total=len(images), desc=f"Scanning {cam_key}", unit="img")
+        
+        for img_file in images:
             img_name = img_file.strip().lower()
             telemetry = lookup.get(img_name)
             if telemetry is None:
+                pbar.update(1)
                 continue   # image not in the coordonate file, skip it
 
             img_path = os.path.join(folder_path, img_file)
             img_full = cv2.imread(img_path)
             if img_full is None:
+                pbar.update(1)
                 continue
 
-            # tile inference path (default) vs. legacy full-image path
             if cfg.use_tiled_inference:
                 img_cropped, y_offset = _preprocess_for_inference(img_full, cfg)
-                detections = _predict_with_tiles(
-                    model, img_cropped, cfg, device, use_half,
-                )
+                img_chunk_data.append(img_cropped)
+                img_chunk_offsets.append(y_offset)
             else:
-                # legacy single-shot inference — kept around for comparison
-                results = model.predict(
-                    source=img_path, conf=cfg.base_conf, iou=cfg.iou_threshold,
-                    imgsz=cfg.image_width, augment=cfg.use_tta, half=use_half,
-                    device=device, verbose=False,
-                )
-                detections = []
-                for r in results:
-                    for box in r.boxes:
-                        bx1, by1, bx2, by2 = box.xyxy[0].tolist()
-                        detections.append({
-                            "xyxy": [bx1, by1, bx2, by2],
-                            "conf": float(box.conf[0]),
-                        })
-                y_offset = 0
+                img_chunk_data.append(img_full)
+                img_chunk_offsets.append(0)
+                
+            img_chunk_files.append(img_name)
 
-            # track how many candidates the model found at base_conf
-            # before we filter to the user's actual threshold
-            n_raw_total += len(detections)
+            if len(img_chunk_files) >= chunk_size:
+                process_chunk(img_chunk_files, img_chunk_data, img_chunk_offsets)
+                pbar.update(len(img_chunk_files))
+                img_chunk_files.clear()
+                img_chunk_data.clear()
+                img_chunk_offsets.clear()
 
-            # filter to the user's actual confidence threshold (we scanned at
-            # cfg.base_conf which is much lower — that's just to give us a wider
-            # net of candidates, the real filter happens here)
-            detections = [d for d in detections if d["conf"] >= cfg.confidence]
-            n_after_filter += len(detections)
-
-            if not detections:
-                continue
-
-            car_x = float(telemetry["X_Stereo70"])
-            car_y = float(telemetry["Y_Stereo70"])
-            car_z = float(telemetry["Z"])
-            car_h = float(telemetry["Heading_deg"])
-
-            for det in detections:
-                x1, y1, x2, y2 = det["xyxy"]
-                # map y coords back to the FULL original image — we cropped
-                # off y_offset pixels from the top before tiling
-                y1 += y_offset
-                y2 += y_offset
-
-                conf    = det["conf"]
-                bbox_cx = (x1 + x2) / 2.0
-                bbox_cy = (y1 + y2) / 2.0   # centre, not bottom — see notes in calculate_gps_offset_3d
-
-                geo = calculate_gps_offset_3d(
-                    car_x, car_y, car_z, car_h,
-                    bbox_cx, bbox_cy, mount_ang,
-                    kdtree, points, cfg, geoid_undulation,
-                )
-
-                if geo["x"] is None:
-                    # ray was pointing upward, nothing we can do with this one
-                    continue
-
-                det_record = {
-                    "image":        img_name,
-                    "cam_key":      cam_key,
-                    "folder_path":  folder_path,
-                    "x1": int(x1), "y1": int(y1),
-                    "x2": int(x2), "y2": int(y2),
-                    "conf":         conf,
-                    "x":            geo["x"],
-                    "y":            geo["y"],
-                    "z":            geo["z"],
-                    "lidar_hit":    geo["lidar_hit"],     # True = sub-metre accuracy
-                    "px_edge_flag": geo["px_edge_flag"],  # True = near frame edge, less accurate
-                    "range_m":      geo["range_m"],       # how far the ray travelled to hit something
-                    "_car_heading_deg":  car_h,           # kept for the heading sanity check, not exported
-                    "true_heading_deg":  geo["true_heading_deg"],
-                }
-                all_detections.append(det_record)
-                n_det += 1
-
-                if len(heading_check_sample) < 5:
-                    heading_check_sample.append(det_record)
+        # process any remaining
+        if img_chunk_files:
+            process_chunk(img_chunk_files, img_chunk_data, img_chunk_offsets)
+            pbar.update(len(img_chunk_files))
+            img_chunk_files.clear()
+            img_chunk_data.clear()
+            img_chunk_offsets.clear()
+            
+        pbar.close()
 
         # diagnostic summary — if n_raw_total is 0, the model isn't finding
         # ANYTHING even at the very low base_conf threshold. that means the
