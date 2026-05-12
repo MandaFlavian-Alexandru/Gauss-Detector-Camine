@@ -41,14 +41,14 @@ echo Starting Services...
 echo.
 
 :: Start FastAPI Backend in a new window
-start "Gauss Backend" cmd /k "call .venv\Scripts\activate.bat && set PYTHONPATH=%cd% && uvicorn Gauss_MD_API:app --host 0.0.0.0 --port 8001 --app-dir ."
+start "Gauss Backend" cmd /k "call .venv\Scripts\activate.bat && set PYTHONPATH=%cd% && uvicorn Gauss_MD_API:app --host 0.0.0.0 --port 8002 --app-dir ."
 
 :: Start Next.js Frontend in a new window
-start "Gauss Frontend" cmd /k "cd frontend && npm start -- -p 3001"
+start "Gauss Frontend" cmd /k "cd frontend && npm start -- -p 3002"
 
 echo Application started! 
-echo - Dashboard: http://localhost:3001
-echo - Backend:   http://localhost:8001
+echo - Dashboard: http://localhost:3002
+echo - Backend:   http://localhost:8002
 echo.
 echo You can close this launcher window. The services are running in the newly opened windows.
 pause

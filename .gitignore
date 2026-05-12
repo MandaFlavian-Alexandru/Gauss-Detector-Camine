@@ -28,6 +28,9 @@ venv/
 *.cpg
 *.geojson
 *.json
+!package.json
+!package-lock.json
+!tsconfig.json
 
 # Results / Output
 Results_*/

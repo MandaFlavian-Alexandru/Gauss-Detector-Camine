@@ -73,7 +73,7 @@ export default function Home() {
         
         activeSessions.forEach(async (rs) => {
           try {
-            const statusRes = await fetch(`http://localhost:8001/api/status?session_id=${rs.id}`);
+            const statusRes = await fetch(`http://localhost:8002/api/status?session_id=${rs.id}`);
             const data = await statusRes.json();
             
             setSessions(currentSessions => currentSessions.map(cs => {
@@ -112,7 +112,7 @@ export default function Home() {
 
   const fetchResults = async (sessionId: string, startTime: number) => {
     try {
-      const resData = await fetch(`http://localhost:8001/api/results?session_id=${sessionId}`);
+      const resData = await fetch(`http://localhost:8002/api/results?session_id=${sessionId}`);
       const finalResults = await resData.json();
 
       const durationMs = Date.now() - startTime;
@@ -149,7 +149,7 @@ export default function Home() {
     setIsSubmitting(true);
     
     try {
-      const res = await fetch("http://localhost:8001/api/analyze", {
+      const res = await fetch("http://localhost:8002/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -191,7 +191,7 @@ export default function Home() {
       setLasFolderPath("");
     } catch (e) {
       console.error("Failed to start analysis:", e);
-      alert("ERROR: Could not connect to Gauss Python Node on Port 8001.");
+      alert("ERROR: Could not connect to Gauss Python Node on Port 8002.");
     } finally {
       setIsSubmitting(false);
     }
@@ -199,7 +199,7 @@ export default function Home() {
 
   const handleCancelAnalysis = async (sessionId: string) => {
     try {
-      await fetch(`http://localhost:8001/api/cancel?session_id=${sessionId}`, { method: "POST" });
+      await fetch(`http://localhost:8002/api/cancel?session_id=${sessionId}`, { method: "POST" });
       setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, status: 'cancelled' } : s));
     } catch (e) {
       console.error(e);
@@ -245,14 +245,14 @@ export default function Home() {
       const payload = activeSession.resultsData;
 
       // Backend generation STRICTLY uses activeSession.resultsData (excluding trashBin logic naturally!)
-      const res = await fetch("http://localhost:8001/api/generate_final_export", {
+      const res = await fetch("http://localhost:8002/api/generate_final_export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: activeSessionId, results: payload })
       });
       if (!res.ok) throw new Error("Failed to generate export");
       
-      window.location.href = `http://localhost:8001/api/download_shapefile?session_id=${activeSessionId}`;
+      window.location.href = `http://localhost:8002/api/download_shapefile?session_id=${activeSessionId}`;
     } catch(e) {
       console.error(e);
       alert("Error exporting data");
@@ -633,7 +633,7 @@ export default function Home() {
                         )}
 
                         <div className="aspect-square bg-gray-100 relative overflow-hidden">
-                          <Image src={`http://localhost:8001/images/${activeSessionId}/${item.cam_key}_${item.image}`} alt={item.image} fill className={`object-cover transition-transform duration-700 ease-in-out group-hover:scale-110 unoptimized ${dashboardViewMode === 'trash' ? 'grayscale' : ''}`} unoptimized/>
+                          <Image src={`http://localhost:8002/images/${activeSessionId}/${item.cam_key}_${item.image}`} alt={item.image} fill className={`object-cover transition-transform duration-700 ease-in-out group-hover:scale-110 unoptimized ${dashboardViewMode === 'trash' ? 'grayscale' : ''}`} unoptimized/>
                         </div>
                         <div className={`p-3 text-[10px] font-mono border-t flex flex-col gap-0.5 ${dashboardViewMode === 'trash' ? 'bg-red-50 text-red-800' : (item.clustered ? 'bg-yellow-50 text-yellow-800 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200')}`}>
                           <span className="truncate w-full font-bold" title={item.image}>{item.image}</span>
@@ -705,7 +705,7 @@ export default function Home() {
             <div ref={zoomImageRef} className={`relative transition-transform duration-200 ease-out flex-shrink-0 ${dashboardViewMode === 'trash' ? 'grayscale' : ''}`} style={{ transform: `scale(${zoomLevel})`, transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%` }}>
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img 
-                src={`http://localhost:8001/images/${activeSessionId}/${currentImageArray[selectedIndex].cam_key}_${currentImageArray[selectedIndex].image}`} 
+                src={`http://localhost:8002/images/${activeSessionId}/${currentImageArray[selectedIndex].cam_key}_${currentImageArray[selectedIndex].image}`} 
                 alt={currentImageArray[selectedIndex].image}
                 className="max-w-[90vw] max-h-[85vh] object-contain rounded shadow-2xl"
                 draggable={false}
