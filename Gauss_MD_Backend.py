@@ -10,6 +10,14 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+# Restrict threading at the C/C++ level BEFORE importing heavy numerical libraries
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
+os.environ["NUMEXPR_NUM_THREADS"] = "4"
+
+
 import cv2
 import geopandas as gpd
 import laspy
@@ -622,6 +630,7 @@ def _predict_with_tiles(
         augment=cfg.use_tta,
         half=use_half,
         device=device,
+        workers=0,                 # force single-threaded data loading
         verbose=False,
     )
 
