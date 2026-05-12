@@ -32,6 +32,7 @@ export interface Session {
   trashBin: DetectionResult[];
   processDuration: string;
   startTime: number;
+  shapefileGenerated?: boolean;
 }
 
 // Dynamically import MapView to prevent SSR issues with Leaflet
@@ -252,6 +253,8 @@ export default function Home() {
       });
       if (!res.ok) throw new Error("Failed to generate export");
       
+      setSessions(prev => prev.map(s => s.id === activeSessionId ? { ...s, shapefileGenerated: true } : s));
+
       window.location.href = `http://localhost:8002/api/download_shapefile?session_id=${activeSessionId}`;
     } catch(e) {
       console.error(e);
@@ -530,7 +533,15 @@ export default function Home() {
                          
                          {s.status === 'completed' && (
                            <div className="border-t border-gray-100 pt-3 mt-1 flex justify-between items-center">
-                             <span className="text-xs text-gray-500">Found {s.resultsData.length} records.</span>
+                             <div className="flex flex-col">
+                               <span className="text-xs text-gray-500">Found {s.resultsData.length} records.</span>
+                               {s.shapefileGenerated && (
+                                 <span className="text-[10px] font-bold text-green-600 mt-0.5 flex items-center gap-1">
+                                   <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                   SHAPEFILE EXPORTED
+                                 </span>
+                               )}
+                             </div>
                              <button 
                                onClick={() => setActiveSessionId(s.id)}
                                className="bg-brand-primary text-white px-4 py-1.5 rounded text-sm font-bold shadow hover:bg-brand-secondary transition-colors"
