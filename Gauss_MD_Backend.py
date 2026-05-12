@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import pyproj
 import torch
+import torchvision
 from scipy.spatial import KDTree
 from shapely.geometry import Point
 from tqdm import tqdm
@@ -60,7 +61,7 @@ class PipelineConfig:
     image_width:      int   = 1280
     image_height:     int   = 1632
     use_tta:          bool  = True   # test-time augmentation, helps catch edge cases
-    batch_size:       int   = 24
+    batch_size:       int   = 96
     camera_height:    float = 2.45   # ladybug sits about 2.45m off the ground
     h_fov:            float = 60.0   # horizontal field of view per camera in degrees
 
@@ -591,53 +592,68 @@ def _predict_with_tiles_batch(
     use_half:  bool,
 ) -> list[list[dict]]:
     """
-    Batched Tile-based YOLO inference. Slices multiple images into overlapping 
-    640x640 tiles, runs detection on all tiles in a single massive GPU call, 
-    then merges the results back to each respective image's coordinate space.
+    GPU-native batched tile inference.
+
+    One bulk CPU→GPU transfer uploads all images at once. Tiles are sliced as
+    zero-copy tensor views on-device and edge tiles are reflect-padded with
+    torch.nn.functional.pad (no CPU involvement). The pre-built (N_tiles, C, H, W)
+    float tensor is handed directly to YOLO, eliminating N_tiles separate memcpys.
+    Cross-tile NMS runs on GPU via torchvision.ops.nms instead of cv2.dnn.NMSBoxes.
     """
     if not imgs:
         return []
 
     h, w = imgs[0].shape[:2]
-    tile = cfg.tile_size
+    tile    = cfg.tile_size
     origins = _generate_tile_origins(w, h, tile, cfg.tile_overlap)
+    dtype   = torch.float16 if use_half else torch.float32
 
-    crops = []
-    tile_to_img_idx = []
+    # One bulk CPU→GPU transfer for the entire chunk
+    img_batch = (
+        torch.from_numpy(np.stack(imgs, axis=0))   # N H W C  uint8  CPU
+        .to(device=device, dtype=dtype)             # N H W C  float  GPU
+        .permute(0, 3, 1, 2)                        # N C H W
+        .contiguous()
+        .div_(255.0)
+    )
 
-    for img_idx, img in enumerate(imgs):
+    tile_list:       list[torch.Tensor] = []
+    tile_to_img_idx: list[tuple]        = []
+
+    for img_idx in range(len(imgs)):
+        img_t = img_batch[img_idx]              # C H W — view, zero data copy
         for x0, y0 in origins:
-            x1 = min(x0 + tile, w)
-            y1 = min(y0 + tile, h)
-            crop = img[y0:y1, x0:x1]
-
-            ph = tile - crop.shape[0]
-            pw = tile - crop.shape[1]
+            x1   = min(x0 + tile, w)
+            y1   = min(y0 + tile, h)
+            crop = img_t[:, y0:y1, x0:x1]      # view on GPU
+            ph   = tile - crop.shape[1]
+            pw   = tile - crop.shape[2]
             if ph > 0 or pw > 0:
-                crop = cv2.copyMakeBorder(crop, 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
-                
-            crops.append(crop)
+                # reflect-pad on GPU — replaces cv2.copyMakeBorder on CPU
+                crop = torch.nn.functional.pad(crop, (0, pw, 0, ph), mode='reflect')
+            tile_list.append(crop)
             tile_to_img_idx.append((img_idx, x0, y0))
 
-    if not crops:
+    if not tile_list:
         return [[] for _ in imgs]
 
-    # Run inference on ALL tiles from ALL images in a single batched call
+    # Single contiguous (N_tiles, C, H, W) tensor — all on GPU, no per-tile transfers
+    batch_tensor = torch.stack(tile_list, dim=0)
+
     results = model.predict(
-        source=crops,
-        batch=cfg.batch_size,      # pushes the GPU properly
+        source=batch_tensor,
+        batch=cfg.batch_size,
         conf=cfg.base_conf,
         iou=cfg.iou_threshold,
         imgsz=tile,
         augment=cfg.use_tta,
         half=use_half,
         device=device,
-        workers=0,                 # single-threaded loader to save CPU
+        workers=0,
         verbose=False,
     )
 
-    all_boxes_per_img = [[] for _ in imgs]
-
+    all_boxes_per_img: list[list] = [[] for _ in imgs]
     for r, (img_idx, x0, y0) in zip(results, tile_to_img_idx):
         for box in r.boxes:
             bx1, by1, bx2, by2 = box.xyxy[0].tolist()
@@ -648,27 +664,16 @@ def _predict_with_tiles_batch(
             ])
 
     final_detections_per_img = []
-
     for img_boxes in all_boxes_per_img:
         if not img_boxes:
             final_detections_per_img.append([])
             continue
 
-        arr   = np.array(img_boxes, dtype=np.float64)
-        boxes = arr[:, :4].tolist()
-        scores = arr[:, 4].tolist()
-        keep  = cv2.dnn.NMSBoxes(
-            bboxes=boxes,
-            scores=scores,
-            score_threshold=cfg.base_conf,
-            nms_threshold=cfg.iou_threshold,
-        )
-        if len(keep) == 0:
-            final_detections_per_img.append([])
-            continue
-            
-        keep = np.array(keep).flatten()
-        kept = arr[keep]
+        # GPU-side cross-tile NMS — replaces cv2.dnn.NMSBoxes on CPU
+        arr      = torch.tensor(img_boxes, dtype=torch.float32, device=device)
+        keep     = torchvision.ops.nms(arr[:, :4], arr[:, 4], cfg.iou_threshold)
+        kept     = arr[keep]
+        kept     = kept[kept[:, 4] >= cfg.base_conf].cpu().numpy()
 
         final_detections_per_img.append([
             {"xyxy": [float(v) for v in row[:4]], "conf": float(row[4])}
@@ -850,9 +855,10 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         n_raw_total    = 0   # detections found at base_conf, before final threshold
         n_after_filter = 0   # detections that survived the final cfg.confidence filter
 
-        # We want to process images in chunks.
-        # Since each image produces 6 tiles, chunk_size = max(1, cfg.batch_size // 6)
-        chunk_size = max(1, cfg.batch_size // 6)
+        # With GPU-side tiling, chunk_size = batch_size images per chunk.
+        # The tile loop generates chunk_size × n_tile_origins tiles on GPU per YOLO call,
+        # keeping the 4090 busy 6× longer between CPU I/O cycles.
+        chunk_size = cfg.batch_size
 
         def process_chunk(files, img_data_list, offsets):
             nonlocal n_det, n_raw_total, n_after_filter, all_detections, heading_check_sample
