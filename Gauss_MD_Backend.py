@@ -594,11 +594,12 @@ def _predict_with_tiles_batch(
     """
     GPU-native batched tile inference.
 
-    One bulk CPU→GPU transfer uploads all images at once. Tiles are sliced as
-    zero-copy tensor views on-device and edge tiles are reflect-padded with
-    torch.nn.functional.pad (no CPU involvement). The pre-built (N_tiles, C, H, W)
-    float tensor is handed directly to YOLO, eliminating N_tiles separate memcpys.
-    Cross-tile NMS runs on GPU via torchvision.ops.nms instead of cv2.dnn.NMSBoxes.
+    Images are uploaded one at a time (~3-4 MB each) via torch.from_numpy zero-copy
+    views, avoiding a single massive np.stack that would block the main thread with
+    hundreds of MB of CPU memcpy. Tiles are sliced as GPU tensor views + F.pad.
+    Box coordinates stay on GPU until the very end: r.boxes.xyxy returns the raw
+    GPU tensor so we accumulate, offset, and NMS entirely on-device, then do one
+    bulk .cpu() pull per image instead of one CUDA sync per box.
     """
     if not imgs:
         return []
@@ -608,28 +609,27 @@ def _predict_with_tiles_batch(
     origins = _generate_tile_origins(w, h, tile, cfg.tile_overlap)
     dtype   = torch.float16 if use_half else torch.float32
 
-    # One bulk CPU→GPU transfer for the entire chunk
-    img_batch = (
-        torch.from_numpy(np.stack(imgs, axis=0))   # N H W C  uint8  CPU
-        .to(device=device, dtype=dtype)             # N H W C  float  GPU
-        .permute(0, 3, 1, 2)                        # N C H W
-        .contiguous()
-        .div_(255.0)
-    )
-
     tile_list:       list[torch.Tensor] = []
     tile_to_img_idx: list[tuple]        = []
 
-    for img_idx in range(len(imgs)):
-        img_t = img_batch[img_idx]              # C H W — view, zero data copy
+    for img_idx, img in enumerate(imgs):
+        # torch.from_numpy is a zero-copy view of the numpy buffer.
+        # Uploading one image at a time (~3-4 MB) avoids the giant
+        # np.stack() call that would pin hundreds of MB in the main thread.
+        img_t = (
+            torch.from_numpy(img)
+            .to(device=device, dtype=dtype)   # small upload, no intermediate CPU copy
+            .permute(2, 0, 1)                 # HWC → CHW on GPU
+            .contiguous()
+            .div_(255.0)
+        )
         for x0, y0 in origins:
             x1   = min(x0 + tile, w)
             y1   = min(y0 + tile, h)
-            crop = img_t[:, y0:y1, x0:x1]      # view on GPU
+            crop = img_t[:, y0:y1, x0:x1]    # GPU view — no copy
             ph   = tile - crop.shape[1]
             pw   = tile - crop.shape[2]
             if ph > 0 or pw > 0:
-                # reflect-pad on GPU — replaces cv2.copyMakeBorder on CPU
                 crop = torch.nn.functional.pad(crop, (0, pw, 0, ph), mode='reflect')
             tile_list.append(crop)
             tile_to_img_idx.append((img_idx, x0, y0))
@@ -637,8 +637,7 @@ def _predict_with_tiles_batch(
     if not tile_list:
         return [[] for _ in imgs]
 
-    # Single contiguous (N_tiles, C, H, W) tensor — all on GPU, no per-tile transfers
-    batch_tensor = torch.stack(tile_list, dim=0)
+    batch_tensor = torch.stack(tile_list, dim=0)   # (N_tiles, C, H, W) on GPU
 
     results = model.predict(
         source=batch_tensor,
@@ -653,28 +652,30 @@ def _predict_with_tiles_batch(
         verbose=False,
     )
 
-    all_boxes_per_img: list[list] = [[] for _ in imgs]
+    # Accumulate box tensors entirely on GPU.
+    # r.boxes.xyxy is already a GPU tensor — applying the tile offset here on GPU
+    # means we never call .tolist() per box, eliminating one CUDA sync per detection.
+    all_boxes_gpu: list[list[torch.Tensor]] = [[] for _ in imgs]
     for r, (img_idx, x0, y0) in zip(results, tile_to_img_idx):
-        for box in r.boxes:
-            bx1, by1, bx2, by2 = box.xyxy[0].tolist()
-            all_boxes_per_img[img_idx].append([
-                bx1 + x0, by1 + y0,
-                bx2 + x0, by2 + y0,
-                float(box.conf[0]),
-            ])
+        if r.boxes is None or len(r.boxes) == 0:
+            continue
+        xyxy   = r.boxes.xyxy                                          # GPU (N, 4)
+        conf   = r.boxes.conf.unsqueeze(1)                             # GPU (N, 1)
+        offset = torch.tensor([x0, y0, x0, y0], dtype=xyxy.dtype, device=device)
+        all_boxes_gpu[img_idx].append(
+            torch.cat([xyxy + offset, conf], dim=1)                    # GPU (N, 5)
+        )
 
+    # One GPU→CPU transfer per image after NMS — not one per box
     final_detections_per_img = []
-    for img_boxes in all_boxes_per_img:
-        if not img_boxes:
+    for box_list in all_boxes_gpu:
+        if not box_list:
             final_detections_per_img.append([])
             continue
-
-        # GPU-side cross-tile NMS — replaces cv2.dnn.NMSBoxes on CPU
-        arr      = torch.tensor(img_boxes, dtype=torch.float32, device=device)
-        keep     = torchvision.ops.nms(arr[:, :4], arr[:, 4], cfg.iou_threshold)
-        kept     = arr[keep]
-        kept     = kept[kept[:, 4] >= cfg.base_conf].cpu().numpy()
-
+        arr  = torch.cat(box_list, dim=0)                              # (N_total, 5)
+        keep = torchvision.ops.nms(arr[:, :4], arr[:, 4], cfg.iou_threshold)
+        kept = arr[keep]
+        kept = kept[kept[:, 4] >= cfg.base_conf].cpu().numpy()         # single sync
         final_detections_per_img.append([
             {"xyxy": [float(v) for v in row[:4]], "conf": float(row[4])}
             for row in kept
@@ -855,10 +856,12 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         n_raw_total    = 0   # detections found at base_conf, before final threshold
         n_after_filter = 0   # detections that survived the final cfg.confidence filter
 
-        # With GPU-side tiling, chunk_size = batch_size images per chunk.
-        # The tile loop generates chunk_size × n_tile_origins tiles on GPU per YOLO call,
-        # keeping the 4090 busy 6× longer between CPU I/O cycles.
-        chunk_size = cfg.batch_size
+        # chunk_size = images fed to _predict_with_tiles_batch per call.
+        # Each image produces ~6 tiles, so this gives batch_size tiles per YOLO call
+        # (e.g. 96 batch_size / 6 = 16 images → 96 tiles). Larger than the old 4-image
+        # chunks so the GPU stays busier, but small enough that the per-image upload
+        # loop and torch.stack don't pin the main thread for hundreds of ms.
+        chunk_size = max(1, cfg.batch_size // 6)
 
         def process_chunk(files, img_data_list, offsets):
             nonlocal n_det, n_raw_total, n_after_filter, all_detections, heading_check_sample
