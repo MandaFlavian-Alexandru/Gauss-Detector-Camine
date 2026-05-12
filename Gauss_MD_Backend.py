@@ -944,37 +944,41 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         
         from concurrent.futures import ThreadPoolExecutor
 
-        # Use 4 threads to prefetch. This is enough to outpace the network
-        # while keeping CPU usage low (since cv2 releases GIL).
+        # Break images into explicit chunks so we only load a small bounded amount at a time
+        image_chunks = [images[i:i + chunk_size] for i in range(0, len(images), chunk_size)]
+        
+        # Use ThreadPoolExecutor to overlap I/O and Compute using a Double-Buffer pattern
         with ThreadPoolExecutor(max_workers=4) as executor:
-            batch_files = []
-            batch_data = []
-            batch_offsets = []
-            
-            # Map yields results in order, streaming them as they complete.
-            for result in executor.map(_load_and_prep, images):
-                if result is None:
-                    pbar.update(1)
-                    continue
-                    
-                img_name, img_data, offset = result
-                batch_files.append(img_name)
-                batch_data.append(img_data)
-                batch_offsets.append(offset)
+            # Submit the very first chunk to the threads
+            if image_chunks:
+                next_futures = [executor.submit(_load_and_prep, img) for img in image_chunks[0]]
+            else:
+                next_futures = []
                 
-                if len(batch_files) >= chunk_size:
+            for i in range(len(image_chunks)):
+                current_futures = next_futures
+                
+                # Submit the NEXT chunk so it downloads while the GPU processes the current one
+                if i + 1 < len(image_chunks):
+                    next_futures = [executor.submit(_load_and_prep, img) for img in image_chunks[i+1]]
+                    
+                batch_files = []
+                batch_data = []
+                batch_offsets = []
+                
+                # Gather the results of the CURRENT chunk
+                for future in current_futures:
+                    result = future.result()
+                    if result is not None:
+                        img_name, img_data, offset = result
+                        batch_files.append(img_name)
+                        batch_data.append(img_data)
+                        batch_offsets.append(offset)
+                        
+                # Process the CURRENT chunk on the GPU
+                if batch_files:
                     process_chunk(batch_files, batch_data, batch_offsets)
                     pbar.update(len(batch_files))
-                    batch_files.clear()
-                    batch_data.clear()
-                    batch_offsets.clear()
-                    
-            if batch_files:
-                process_chunk(batch_files, batch_data, batch_offsets)
-                pbar.update(len(batch_files))
-                batch_files.clear()
-                batch_data.clear()
-                batch_offsets.clear()
             
         pbar.close()
 
