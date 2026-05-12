@@ -22,7 +22,9 @@ from shapely.geometry import Point
 from tqdm import tqdm
 from ultralytics import YOLO
 
-
+# Limit PyTorch and OpenCV threads to reduce excessive CPU usage on high-core-count processors (like i9 13900K)
+torch.set_num_threads(4)
+cv2.setNumThreads(4)
 # ---
 # Config
 # ---
