@@ -54,6 +54,29 @@ class PipelineConfig:
     camera_height:    float = 2.45   # ladybug sits about 2.45m off the ground
     h_fov:            float = 60.0   # horizontal field of view per camera in degrees
 
+    # ---
+    # tiled inference settings (for cross-domain model deployment)
+    # ---
+    # we're running a model trained on dashcam images (wide landscape, rectilinear)
+    # against ladybug images (tall portrait, fisheye). that's a big visual gap and
+    # straight model.predict() at the native resolution doesn't catch anything.
+    #
+    # the workaround is:
+    #   1. crop out the sky/upper region — training had a "blind zone" mask there
+    #   2. slice the result into overlapping square tiles
+    #   3. run YOLO on each tile at the tile's native size (no letterboxing squash)
+    #   4. merge detections back to original image coords with NMS
+    #
+    # tweak the values below if you want to tune speed vs recall.
+    use_tiled_inference: bool   = True   # turn off to fall back to plain model.predict
+    roi_crop_top:        float  = 0.40   # fraction of image height to crop off the top
+    tile_size:           int    = 640    # YOLOv8's native training size — best feature match
+    tile_overlap:        float  = 0.30   # overlap between adjacent tiles (0–1)
+    base_conf:           float  = 0.10   # very low threshold during the scan; we filter
+                                          # by `confidence` at the end. this catches manholes
+                                          # that the model is uncertain about (which is most of
+                                          # them given the domain shift).
+
     # vertical datum correction — if None we calculate it automatically from the data.
     # for this recording area in Romania it ends up being ~39.1m.
     # you can hardcode it here if you already know it for a given recording area.
@@ -493,6 +516,139 @@ def calculate_gps_offset_3d(
 # Helpers
 # ---
 
+# ---
+# Tiled inference helpers (for cross-domain model deployment)
+# ---
+
+def _preprocess_for_inference(img: np.ndarray, cfg: PipelineConfig) -> Tuple[np.ndarray, int]:
+    """
+    Crops the top portion of the image to roughly mimic the "AI BLIND ZONE"
+    that was masked out during the model's training. The training dashcam
+    images had the upper ~30% ignored — sky, distant buildings, anything
+    above the road. For our taller ladybug images, cropping the top 40%
+    leaves us with the road surface, which is where manholes actually live.
+
+    Returns (cropped_image, y_offset). The y_offset is how many pixels were
+    sliced off the top — we need it to map detection coordinates back to
+    the original image after inference.
+    """
+    h = img.shape[0]
+    y_offset = int(h * cfg.roi_crop_top)
+    return img[y_offset:, :], y_offset
+
+
+def _generate_tile_origins(image_w: int, image_h: int, tile: int, overlap: float) -> list:
+    """
+    Lays out a grid of tile origin positions that fully covers the image,
+    with the requested overlap between adjacent tiles. The last column/row
+    is always shifted back so it touches the image edge — no gaps at the
+    right or bottom.
+    """
+    step = max(1, int(tile * (1 - overlap)))
+
+    xs = list(range(0, max(1, image_w - tile + 1), step))
+    if not xs:
+        xs = [0]
+    if xs[-1] + tile < image_w:
+        xs.append(max(0, image_w - tile))
+
+    ys = list(range(0, max(1, image_h - tile + 1), step))
+    if not ys:
+        ys = [0]
+    if ys[-1] + tile < image_h:
+        ys.append(max(0, image_h - tile))
+
+    return [(x, y) for y in ys for x in xs]
+
+
+def _predict_with_tiles(
+    model:     YOLO,
+    img:       np.ndarray,
+    cfg:       PipelineConfig,
+    device:    str,
+    use_half:  bool,
+) -> list[dict]:
+    """
+    Tile-based YOLO inference. Slices the image into overlapping 640x640
+    tiles (matching YOLOv8's native training resolution), runs detection on
+    each tile, then merges the results back to the full image coordinate
+    space and applies NMS to clean up duplicates along the seams.
+
+    This is what makes detection work despite the domain shift between
+    dashcam training data and ladybug deployment imagery. Each tile is
+    fed to the model at its native resolution with no letterbox squashing,
+    so small manholes keep their actual pixel size. Each tile is also a
+    small enough region that local fisheye curvature is minimal.
+
+    Returns: list of {'xyxy': [x1, y1, x2, y2], 'conf': float}, where
+    coordinates are in the original image's pixel space.
+    """
+    h, w = img.shape[:2]
+    tile = cfg.tile_size
+
+    origins = _generate_tile_origins(w, h, tile, cfg.tile_overlap)
+
+    all_boxes: list[list[float]] = []  # rows of [x1, y1, x2, y2, conf]
+
+    for x0, y0 in origins:
+        x1 = min(x0 + tile, w)
+        y1 = min(y0 + tile, h)
+        crop = img[y0:y1, x0:x1]
+
+        # if the tile is smaller than the requested size (because we're at
+        # the edge of the image), pad it with reflected pixels so YOLO gets
+        # a clean square. reflection is better than black padding — black
+        # creates artificial edges that confuse the detector.
+        ph = tile - crop.shape[0]
+        pw = tile - crop.shape[1]
+        if ph > 0 or pw > 0:
+            crop = cv2.copyMakeBorder(crop, 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
+
+        results = model.predict(
+            source=crop,
+            conf=cfg.base_conf,        # very low — we want every candidate
+            iou=cfg.iou_threshold,
+            imgsz=tile,                 # tile is already the right size, no resize
+            augment=cfg.use_tta,
+            half=use_half,
+            device=device,
+            verbose=False,
+        )
+
+        for r in results:
+            for box in r.boxes:
+                bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                # convert from tile-local coords back to full-image coords
+                all_boxes.append([
+                    bx1 + x0, by1 + y0,
+                    bx2 + x0, by2 + y0,
+                    float(box.conf[0]),
+                ])
+
+    if not all_boxes:
+        return []
+
+    # NMS across all tiles to dedupe boxes that landed in the overlap zones
+    arr   = np.array(all_boxes, dtype=np.float64)
+    boxes = arr[:, :4].tolist()
+    scores = arr[:, 4].tolist()
+    keep  = cv2.dnn.NMSBoxes(
+        bboxes=boxes,
+        scores=scores,
+        score_threshold=cfg.base_conf,
+        nms_threshold=cfg.iou_threshold,
+    )
+    if len(keep) == 0:
+        return []
+    keep = np.array(keep).flatten()
+    kept = arr[keep]
+
+    return [
+        {"xyxy": [float(v) for v in row[:4]], "conf": float(row[4])}
+        for row in kept
+    ]
+
+
 def euclidean_distance(x1, y1, x2, y2) -> float:
     """Straight-line 2D distance in metres between two points."""
     return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
@@ -657,30 +813,74 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                   if f.lower().endswith((".jpg", ".png", ".jpeg"))]
         print(f"  [*] {len(images)} images to process")
 
-        results = model.predict(
-            source=folder_path, conf=cfg.confidence, iou=cfg.iou_threshold,
-            imgsz=cfg.image_width, augment=cfg.use_tta, half=use_half,
-            device=device, stream=True, verbose=False, batch=cfg.batch_size,
-        )
+        # plain model.predict() on the full ladybug image produces zero detections
+        # for the manhole model — see comments on _predict_with_tiles for why.
+        # we now go image-by-image, crop out the sky region, tile the rest, and
+        # run YOLO on each tile separately.
+        n_det          = 0
+        n_raw_total    = 0   # detections found at base_conf, before final threshold
+        n_after_filter = 0   # detections that survived the final cfg.confidence filter
 
-        n_det = 0
-        for r in tqdm(results, total=len(images), desc=f"Scanning {cam_key}", unit="img"):
-            if len(r.boxes) == 0:
-                continue
-
-            img_name  = os.path.basename(r.path).strip().lower()
+        for img_file in tqdm(images, desc=f"Scanning {cam_key}", unit="img"):
+            img_name = img_file.strip().lower()
             telemetry = lookup.get(img_name)
             if telemetry is None:
                 continue   # image not in the coordonate file, skip it
+
+            img_path = os.path.join(folder_path, img_file)
+            img_full = cv2.imread(img_path)
+            if img_full is None:
+                continue
+
+            # tile inference path (default) vs. legacy full-image path
+            if cfg.use_tiled_inference:
+                img_cropped, y_offset = _preprocess_for_inference(img_full, cfg)
+                detections = _predict_with_tiles(
+                    model, img_cropped, cfg, device, use_half,
+                )
+            else:
+                # legacy single-shot inference — kept around for comparison
+                results = model.predict(
+                    source=img_path, conf=cfg.base_conf, iou=cfg.iou_threshold,
+                    imgsz=cfg.image_width, augment=cfg.use_tta, half=use_half,
+                    device=device, verbose=False,
+                )
+                detections = []
+                for r in results:
+                    for box in r.boxes:
+                        bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                        detections.append({
+                            "xyxy": [bx1, by1, bx2, by2],
+                            "conf": float(box.conf[0]),
+                        })
+                y_offset = 0
+
+            # track how many candidates the model found at base_conf
+            # before we filter to the user's actual threshold
+            n_raw_total += len(detections)
+
+            # filter to the user's actual confidence threshold (we scanned at
+            # cfg.base_conf which is much lower — that's just to give us a wider
+            # net of candidates, the real filter happens here)
+            detections = [d for d in detections if d["conf"] >= cfg.confidence]
+            n_after_filter += len(detections)
+
+            if not detections:
+                continue
 
             car_x = float(telemetry["X_Stereo70"])
             car_y = float(telemetry["Y_Stereo70"])
             car_z = float(telemetry["Z"])
             car_h = float(telemetry["Heading_deg"])
 
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf    = float(box.conf[0])
+            for det in detections:
+                x1, y1, x2, y2 = det["xyxy"]
+                # map y coords back to the FULL original image — we cropped
+                # off y_offset pixels from the top before tiling
+                y1 += y_offset
+                y2 += y_offset
+
+                conf    = det["conf"]
                 bbox_cx = (x1 + x2) / 2.0
                 bbox_cy = (y1 + y2) / 2.0   # centre, not bottom — see notes in calculate_gps_offset_3d
 
@@ -694,7 +894,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                     # ray was pointing upward, nothing we can do with this one
                     continue
 
-                det = {
+                det_record = {
                     "image":        img_name,
                     "cam_key":      cam_key,
                     "folder_path":  folder_path,
@@ -710,13 +910,21 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                     "_car_heading_deg":  car_h,           # kept for the heading sanity check, not exported
                     "true_heading_deg":  geo["true_heading_deg"],
                 }
-                all_detections.append(det)
+                all_detections.append(det_record)
                 n_det += 1
 
                 if len(heading_check_sample) < 5:
-                    heading_check_sample.append(det)
+                    heading_check_sample.append(det_record)
 
-        print(f"  [✓] {cam_key} done — {n_det} detections")
+        # diagnostic summary — if n_raw_total is 0, the model isn't finding
+        # ANYTHING even at the very low base_conf threshold. that means the
+        # visual gap between training and inference is too wide and we need
+        # to try other things (lower base_conf even further, undistort the
+        # fisheye, etc).
+        print(f"  [✓] {cam_key} done")
+        print(f"        Raw candidates at conf >= {cfg.base_conf}:  {n_raw_total}")
+        print(f"        After conf >= {cfg.confidence} filter:     {n_after_filter}")
+        print(f"        Geolocated detections kept:                 {n_det}")
 
     _check_heading_convention(heading_check_sample, cfg)
     print(f"\nAll cameras done — {len(all_detections)} total raw detections.")
