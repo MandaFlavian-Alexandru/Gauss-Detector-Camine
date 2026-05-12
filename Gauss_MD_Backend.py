@@ -842,10 +842,6 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         # Since each image produces 6 tiles, chunk_size = max(1, cfg.batch_size // 6)
         chunk_size = max(1, cfg.batch_size // 6)
 
-        img_chunk_files = []
-        img_chunk_data = []
-        img_chunk_offsets = []
-
         def process_chunk(files, img_data_list, offsets):
             nonlocal n_det, n_raw_total, n_after_filter, all_detections, heading_check_sample
 
@@ -927,45 +923,58 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                     if len(heading_check_sample) < 5:
                         heading_check_sample.append(det_record)
 
-        pbar = tqdm(total=len(images), desc=f"Scanning {cam_key}", unit="img")
-        
-        for img_file in images:
+        def _load_and_prep(img_file):
             img_name = img_file.strip().lower()
             telemetry = lookup.get(img_name)
             if telemetry is None:
-                pbar.update(1)
-                continue   # image not in the coordonate file, skip it
-
+                return None
+            
             img_path = os.path.join(folder_path, img_file)
             img_full = cv2.imread(img_path)
             if img_full is None:
-                pbar.update(1)
-                continue
-
+                return None
+                
             if cfg.use_tiled_inference:
                 img_cropped, y_offset = _preprocess_for_inference(img_full, cfg)
-                img_chunk_data.append(img_cropped)
-                img_chunk_offsets.append(y_offset)
+                return (img_name, img_cropped, y_offset)
             else:
-                img_chunk_data.append(img_full)
-                img_chunk_offsets.append(0)
+                return (img_name, img_full, 0)
+
+        pbar = tqdm(total=len(images), desc=f"Scanning {cam_key}", unit="img")
+        
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Use 4 threads to prefetch. This is enough to outpace the network
+        # while keeping CPU usage low (since cv2 releases GIL).
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            batch_files = []
+            batch_data = []
+            batch_offsets = []
+            
+            # Map yields results in order, streaming them as they complete.
+            for result in executor.map(_load_and_prep, images):
+                if result is None:
+                    pbar.update(1)
+                    continue
+                    
+                img_name, img_data, offset = result
+                batch_files.append(img_name)
+                batch_data.append(img_data)
+                batch_offsets.append(offset)
                 
-            img_chunk_files.append(img_name)
-
-            if len(img_chunk_files) >= chunk_size:
-                process_chunk(img_chunk_files, img_chunk_data, img_chunk_offsets)
-                pbar.update(len(img_chunk_files))
-                img_chunk_files.clear()
-                img_chunk_data.clear()
-                img_chunk_offsets.clear()
-
-        # process any remaining
-        if img_chunk_files:
-            process_chunk(img_chunk_files, img_chunk_data, img_chunk_offsets)
-            pbar.update(len(img_chunk_files))
-            img_chunk_files.clear()
-            img_chunk_data.clear()
-            img_chunk_offsets.clear()
+                if len(batch_files) >= chunk_size:
+                    process_chunk(batch_files, batch_data, batch_offsets)
+                    pbar.update(len(batch_files))
+                    batch_files.clear()
+                    batch_data.clear()
+                    batch_offsets.clear()
+                    
+            if batch_files:
+                process_chunk(batch_files, batch_data, batch_offsets)
+                pbar.update(len(batch_files))
+                batch_files.clear()
+                batch_data.clear()
+                batch_offsets.clear()
             
         pbar.close()
 
