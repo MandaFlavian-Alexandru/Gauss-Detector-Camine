@@ -386,7 +386,7 @@ def get_results(session_id: str):
     if not st["results_ready"] or not st["current_output_dir"]:
         return {"status": "not_ready"}
     try:
-        json_path = os.path.join(st["current_output_dir"], "tip_firida_bransament.json")
+        json_path = os.path.join(st["current_output_dir"], "Export_Camine.json")
         if os.path.exists(json_path):
             with open(json_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
