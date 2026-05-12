@@ -509,8 +509,20 @@ def calculate_gps_offset_3d(
     # the road at exactly camera_height below the camera — the only assumption
     # we're making is that the road is locally flat, which is almost always true.
     if centroid_xyz is None:
-        t        = cfg.camera_height / ry
-        dist_gnd = min(math.sqrt((t*rx)**2 + (t*rz)**2), 100.0)
+        # Analytic ray/flat-plane intersection — same algebra as _raycast_ground_plane
+        # but without the KDTree lookup.
+        # t = camera_height / ry  (ry is the downward camera-axis component of the unit ray)
+        # Axis mapping: sin(brng) → X (Easting), cos(brng) → Y (Northing). ✓ for Stereo70.
+        # geoid_undulation subtracted once (→ origin_z); camera_height subtracted once
+        # (→ expected_ground_z and in this t formula). Not double-applied.
+        t = cfg.camera_height / ry
+        if t > 30.0:
+            # Ray grazes the ground beyond the LiDAR scan range — reject rather than
+            # placing the point up to 100 m away outside the point-cloud corridor.
+            return {"x": None, "y": None, "z": None, "lidar_hit": False,
+                    "px_edge_flag": px_edge_flag, "range_m": None,
+                    "true_heading_deg": true_heading_deg}
+        dist_gnd = t * cos_v   # horizontal distance = t * cos(depression_angle)
         centroid_xyz = np.array([
             car_x + math.sin(brng) * dist_gnd,
             car_y + math.cos(brng) * dist_gnd,
@@ -1030,54 +1042,50 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
             det["cluster_members"] = [dict(det)]
             unique_firidas.append(det)
 
-    # Cross-camera merge pass.
-    #
-    # The first pass above uses a tight 2m radius which works great for the same
-    # camera seeing the same firida multiple times as the car drives past. But when
-    # two different cameras both spot the same firida, their ray angles are different
-    # and the calculated coordinates can land 3-8m apart even for the same object.
-    # The 2m threshold misses those matches.
-    #
-    # This pass uses a wider radius and, crucially, actually merges the cluster_members
-    # lists so the gallery ends up with all the photos together in one group. The old
-    # version only set clustered=True without combining anything, which is why you'd
-    # see two separate yellow entries for the same firida.
-    #
-    # We loop until nothing changes because merging two groups can create new pairs.
-    did_merge = True
-    while did_merge:
-        did_merge = False
-        i = 0
-        while i < len(unique_firidas):
-            j = i + 1
-            while j < len(unique_firidas):
-                fi = unique_firidas[i]
-                fj = unique_firidas[j]
-                dist = euclidean_distance(fi["x"], fi["y"], fj["x"], fj["y"])
-                if dist <= cfg.cross_camera_radius_m:
-                    # merge fj into fi — combine their photo lists
-                    if "cluster_members" not in fi:
-                        fi["cluster_members"] = [dict(fi)]
-                    fi["cluster_members"].extend(fj.get("cluster_members", [dict(fj)]))
-                    fi["seen_count"] = fi.get("seen_count", 1) + fj.get("seen_count", 1)
-                    fi["clustered"]  = True
+    # Cross-camera merge — KDTree + Union-Find, O(N log N) vs the old O(N^3) triple loop.
+    # query_pairs finds every pair within the radius in one pass; union-find groups
+    # connected components in near-linear time; a single loop then merges each group.
+    if len(unique_firidas) > 1:
+        coords  = np.array([[f["x"], f["y"]] for f in unique_firidas])
+        cc_tree = KDTree(coords)
+        pairs   = cc_tree.query_pairs(r=cfg.cross_camera_radius_m)
 
-                    # if fj had the better confidence, promote it as the representative
-                    # but keep the merged member list we just built
-                    if fj["conf"] > fi["conf"]:
-                        best = dict(fj)
-                        best["cluster_members"] = fi["cluster_members"]
-                        best["seen_count"]      = fi["seen_count"]
-                        best["clustered"]       = True
-                        unique_firidas[i]       = best
-                        fi = unique_firidas[i]
+        parent = list(range(len(unique_firidas)))
 
-                    unique_firidas.pop(j)
-                    did_merge = True
-                    # don't increment j — the list just got shorter
-                else:
-                    j += 1
-            i += 1
+        def _uf_find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]   # path compression
+                x = parent[x]
+            return x
+
+        for a, b in pairs:
+            ra, rb = _uf_find(a), _uf_find(b)
+            if ra != rb:
+                parent[rb] = ra   # union by first root
+
+        groups: dict[int, list[int]] = {}
+        for idx in range(len(unique_firidas)):
+            groups.setdefault(_uf_find(idx), []).append(idx)
+
+        merged_firidas: list[dict] = []
+        for members in groups.values():
+            if len(members) == 1:
+                merged_firidas.append(unique_firidas[members[0]])
+                continue
+            best_idx = max(members, key=lambda i: unique_firidas[i]["conf"])
+            rep      = dict(unique_firidas[best_idx])
+            all_photos: list[dict] = []
+            total_seen = 0
+            for idx in members:
+                f = unique_firidas[idx]
+                all_photos.extend(f.get("cluster_members", [dict(f)]))
+                total_seen += f.get("seen_count", 1)
+            rep["cluster_members"] = all_photos
+            rep["seen_count"]      = total_seen
+            rep["clustered"]       = True
+            merged_firidas.append(rep)
+
+        unique_firidas = merged_firidas
 
     hit_count = sum(1 for d in unique_firidas if d.get("lidar_hit"))
     total     = len(unique_firidas)

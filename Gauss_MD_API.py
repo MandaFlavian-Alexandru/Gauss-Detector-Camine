@@ -111,7 +111,7 @@ class AnalysisRequest(BaseModel):
     min_confidence: float
     cluster_radius: float
     batch_size: int
-    execution_mode: str = "parallel"
+    execution_mode: str = "sequential"
 
 class DeleteRequest(BaseModel):
     session_id: str
