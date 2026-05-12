@@ -163,9 +163,16 @@ export default function Home() {
         })
       });
 
-      if (!res.ok) throw new Error("API not reachable");
+      let data;
+      try {
+        data = await res.json();
+      } catch (err) {
+        throw new Error("API not reachable");
+      }
 
-      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || "API request failed with status " + res.status);
+      }
       
       if (data.status === 'error') {
          alert(data.message);
@@ -190,9 +197,13 @@ export default function Home() {
       setSessions(prev => [...newSessions, ...prev]);
       setFolderPath("");
       setLasFolderPath("");
-    } catch (e) {
+    } catch (e: any) {
       console.error("Failed to start analysis:", e);
-      alert("ERROR: Could not connect to Gauss Python Node on Port 8002.");
+      if (e.message && e.message !== "API not reachable") {
+        alert("ERROR: " + e.message);
+      } else {
+        alert("ERROR: Could not connect to Gauss Python Node on Port 8002.");
+      }
     } finally {
       setIsSubmitting(false);
     }
