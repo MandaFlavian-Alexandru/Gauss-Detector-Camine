@@ -28,14 +28,6 @@ IF NOT EXIST "frontend\node_modules" (
     echo [2/2] Node.js environment found.
 )
 
-:: Build Next.js if missing
-IF NOT EXIST "frontend\.next" (
-    echo Building Next.js Production Build...
-    cd frontend
-    call npm run build
-    cd ..
-)
-
 echo.
 echo Starting Services...
 echo.
@@ -43,8 +35,8 @@ echo.
 :: Start FastAPI Backend in a new window
 start "Gauss Backend" cmd /k "call .venv\Scripts\activate.bat && set PYTHONPATH=%cd% && uvicorn Gauss_MD_API:app --host 0.0.0.0 --port 8002 --app-dir ."
 
-:: Start Next.js Frontend in a new window
-start "Gauss Frontend" cmd /k "cd frontend && npm start -- -p 3002"
+:: Start Next.js Frontend in a new window (Using dev server to automatically pull new git updates)
+start "Gauss Frontend" cmd /k "cd frontend && npm run dev -- -p 3002"
 
 echo Application started! 
 echo - Dashboard: http://localhost:3002
