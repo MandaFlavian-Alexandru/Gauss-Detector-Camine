@@ -469,6 +469,49 @@ def download_shapefile(session_id: str):
         headers={"Content-Disposition": f"attachment; filename={base_name}.zip"}
     )
 
+@app.get("/api/download_briefcase")
+def download_briefcase(session_id: str):
+    st = load_state(session_id)
+    target_dir = st.get("current_output_dir")
+    source_dir = st.get("source_folder")
+    
+    if not target_dir or not os.path.exists(os.path.join(target_dir, "Export_Camine.json")):
+        return Response(content="Results not generated yet", status_code=404)
+        
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    final_output_dir = os.path.join(desktop_path, f"Gauss_Briefcase_{session_id}")
+    os.makedirs(final_output_dir, exist_ok=True)
+    
+    zip_path = os.path.join(final_output_dir, "Gauss_Briefcase.zip")
+    
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        # Add the JSON
+        json_path = os.path.join(target_dir, "Export_Camine.json")
+        zip_file.write(json_path, arcname="Export_Camine.json")
+        
+        # Read the JSON to find which images are needed
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                results = json.load(f)
+                
+            unique_images = set(r.get("image") for r in results if r.get("image"))
+            
+            # Add all required images
+            if source_dir and os.path.exists(source_dir):
+                for img_name in unique_images:
+                    img_path = os.path.join(source_dir, img_name)
+                    if os.path.exists(img_path):
+                        zip_file.write(img_path, arcname=img_name)
+        except Exception as e:
+            logger.error(f"Failed to package briefcase images: {e}")
+            
+    return FileResponse(
+        path=zip_path, 
+        filename="Gauss_Briefcase.zip", 
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=Gauss_Briefcase.zip"}
+    )
+
 @app.post("/api/cancel")
 def cancel_analysis(session_id: str = Query(...)):
     st = load_state(session_id)

@@ -273,6 +273,11 @@ export default function Home() {
     }
   };
 
+  const handleDownloadBriefcase = () => {
+    if (!activeSessionId) return;
+    window.location.href = `http://localhost:8002/api/download_briefcase?session_id=${activeSessionId}`;
+  };
+
   // Lightbox Handlers
   const handleOpenLightbox = (index: number) => { setSelectedIndex(index); setZoomLevel(1); setZoomOrigin({ x: 50, y: 50 }); };
   const handleCloseLightbox = () => { setSelectedIndex(null); setZoomLevel(1); setZoomOrigin({ x: 50, y: 50 }); };
@@ -687,9 +692,15 @@ export default function Home() {
                   <button 
                     onClick={handleGenerateFinalExport}
                     disabled={!allVerifiedAndClassified || activeSession?.resultsData.length === 0}
-                    className={`w-full py-3.5 rounded-lg font-bold text-sm tracking-widest uppercase flex items-center justify-center gap-3 transition-all ${allVerifiedAndClassified && activeSession?.resultsData.length ? 'bg-white text-brand-primary hover:shadow-xl hover:bg-gray-50 transform group-hover:-translate-y-1 cursor-pointer' : 'bg-white/30 text-white/50 cursor-not-allowed'}`}
+                    className={`w-full py-3.5 mb-3 rounded-lg font-bold text-sm tracking-widest uppercase flex items-center justify-center gap-3 transition-all ${allVerifiedAndClassified && activeSession?.resultsData.length ? 'bg-white text-brand-primary hover:shadow-xl hover:bg-gray-50 transform group-hover:-translate-y-1 cursor-pointer' : 'bg-white/30 text-white/50 cursor-not-allowed'}`}
                   >
                     Generate Shapefile
+                  </button>
+                  <button 
+                    onClick={handleDownloadBriefcase}
+                    className="w-full py-3.5 rounded-lg font-bold text-sm tracking-widest uppercase flex items-center justify-center gap-3 transition-all bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-xl transform group-hover:-translate-y-1 cursor-pointer border border-indigo-400"
+                  >
+                    Download Offline Briefcase
                   </button>
                 </div>
               </div>
