@@ -511,20 +511,11 @@ def calculate_gps_offset_3d(
     # the road at exactly camera_height below the camera — the only assumption
     # we're making is that the road is locally flat, which is almost always true.
     if centroid_xyz is None:
-        # Analytic ray/flat-plane intersection — same algebra as _raycast_ground_plane
-        # but without the KDTree lookup.
-        # t = camera_height / ry  (ry is the downward camera-axis component of the unit ray)
-        # Axis mapping: sin(brng) → X (Easting), cos(brng) → Y (Northing). ✓ for Stereo70.
-        # geoid_undulation subtracted once (→ origin_z); camera_height subtracted once
-        # (→ expected_ground_z and in this t formula). Not double-applied.
-        t = cfg.camera_height / ry
-        if t > 30.0:
-            # Ray grazes the ground beyond the LiDAR scan range — reject rather than
-            # placing the point up to 100 m away outside the point-cloud corridor.
-            return {"x": None, "y": None, "z": None, "lat": None, "lon": None, "lidar_hit": False,
-                    "px_edge_flag": px_edge_flag, "range_m": None,
-                    "true_heading_deg": true_heading_deg}
-        dist_gnd = t * cos_v   # horizontal distance = t * cos(depression_angle)
+        # Same planar method as GaussDetectorFiride — identical bearing math,
+        # capped at 100 m. Manholes are on the ground so z = expected_ground_z
+        # rather than origin_z (which is camera height, 2.45 m too high).
+        t        = cfg.camera_height / ry
+        dist_gnd = min(math.sqrt((t*rx)**2 + (t*rz)**2), 100.0)
         centroid_xyz = np.array([
             car_x + math.sin(brng) * dist_gnd,
             car_y + math.cos(brng) * dist_gnd,
