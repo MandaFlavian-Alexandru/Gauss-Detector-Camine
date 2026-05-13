@@ -504,13 +504,19 @@ def download_briefcase(session_id: str):
                     if member.get("image") and member.get("cam_key"):
                         unique_photos.add((member["cam_key"], member["image"]))
             
-            # Add all required images
-            if source_dir and os.path.exists(source_dir):
-                for cam_key, img_name in unique_photos:
-                    img_path = os.path.join(source_dir, cam_key, img_name)
-                    if os.path.exists(img_path):
-                        # Store in the zip under cam_key/image_name to avoid collisions
-                        zip_file.write(img_path, arcname=f"{cam_key}/{img_name}")
+            # Add all required images.
+            # Primary source: annotated copies in target_dir (guaranteed to exist —
+            # they were just written by the pipeline).  These already have the bbox
+            # rectangle drawn, which is ideal for the validator review UI.
+            # Fallback: original file from source_dir (useful if target_dir is cleaned).
+            for cam_key, img_name in unique_photos:
+                annotated = os.path.join(target_dir, f"{cam_key}_{img_name}")
+                original  = (os.path.join(source_dir, cam_key, img_name)
+                             if source_dir and os.path.exists(source_dir) else "")
+                if os.path.exists(annotated):
+                    zip_file.write(annotated, arcname=f"{cam_key}/{img_name}")
+                elif original and os.path.exists(original):
+                    zip_file.write(original, arcname=f"{cam_key}/{img_name}")
         except Exception as e:
             logger.error(f"Failed to package briefcase images: {e}")
             
