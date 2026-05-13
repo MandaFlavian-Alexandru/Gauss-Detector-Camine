@@ -415,9 +415,15 @@ def generate_final_export(req: FinalExportRequest):
     for col in null_cols:
         df[col] = ""
 
-    # Retain specifically requested metadata columns
+    # Retain specifically requested metadata columns.
+    # NOTE: lat/lon MUST be retained — without them the geometry below falls back
+    # to Stereo70 (EPSG:3844), which has an [N, E] axis-order definition that QGIS
+    # 3.x honors. The shapefile stores points as [X, Y] though, which the tool then
+    # reads as [northing, easting] and reprojects to the wrong location, placing
+    # Romanian points roughly 3° south of where they should be (in northern Bulgaria).
     retain_cols = [
-        "image", "x", "y", "z", "lidar_hit", "px_edge_flag", "range_m", "conf", "cam_key"
+        "image", "x", "y", "z", "lat", "lon", "lidar_hit", "px_edge_flag",
+        "range_m", "conf", "cam_key",
     ] + null_cols
     
     # Drop columns not in retain list to ensure strict schema enforcement
