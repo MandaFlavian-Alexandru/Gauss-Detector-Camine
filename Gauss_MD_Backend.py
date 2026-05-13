@@ -1147,7 +1147,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         df_exp = pd.DataFrame(flat)
 
         # drop columns we don't need in the final output
-        drop = [c for c in ["x1","y1","x2","y2","folder_path","_car_heading_deg"]
+        drop = [c for c in ["folder_path","_car_heading_deg"]
                 if c in df_exp.columns]
         df_exp = df_exp.drop(columns=drop)
 
