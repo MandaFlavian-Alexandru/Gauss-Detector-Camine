@@ -494,14 +494,23 @@ def download_briefcase(session_id: str):
             with open(json_path, 'r', encoding='utf-8') as f:
                 results = json.load(f)
                 
-            unique_images = set(r.get("image") for r in results if r.get("image"))
+            # Keep track of unique (cam_key, image) pairs
+            unique_photos = set()
+            for r in results:
+                if r.get("image") and r.get("cam_key"):
+                    unique_photos.add((r["cam_key"], r["image"]))
+                # Include clustered images as well
+                for member in r.get("cluster_members", []):
+                    if member.get("image") and member.get("cam_key"):
+                        unique_photos.add((member["cam_key"], member["image"]))
             
             # Add all required images
             if source_dir and os.path.exists(source_dir):
-                for img_name in unique_images:
-                    img_path = os.path.join(source_dir, img_name)
+                for cam_key, img_name in unique_photos:
+                    img_path = os.path.join(source_dir, cam_key, img_name)
                     if os.path.exists(img_path):
-                        zip_file.write(img_path, arcname=img_name)
+                        # Store in the zip under cam_key/image_name to avoid collisions
+                        zip_file.write(img_path, arcname=f"{cam_key}/{img_name}")
         except Exception as e:
             logger.error(f"Failed to package briefcase images: {e}")
             
