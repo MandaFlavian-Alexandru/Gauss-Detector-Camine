@@ -484,10 +484,12 @@ def download_briefcase(session_id: str):
     
     zip_path = os.path.join(final_output_dir, "Gauss_Briefcase.zip")
     
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        # Add the JSON
+    # ZIP_STORED: JPEGs are already compressed — DEFLATE gains nothing but wastes
+    # 60-90s of CPU time, which can cause the process to be killed mid-write.
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zip_file:
+        # Add the JSON (small — compress it)
         json_path = os.path.join(target_dir, "Export_Camine.json")
-        zip_file.write(json_path, arcname="Export_Camine.json")
+        zip_file.write(json_path, arcname="Export_Camine.json", compress_type=zipfile.ZIP_DEFLATED)
         
         # Read the JSON to find which images are needed
         try:
