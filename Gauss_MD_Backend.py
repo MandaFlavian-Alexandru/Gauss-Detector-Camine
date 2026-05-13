@@ -11,11 +11,11 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 # Restrict threading at the C/C++ level BEFORE importing heavy numerical libraries
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["OPENBLAS_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
-os.environ["NUMEXPR_NUM_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
+os.environ["NUMEXPR_NUM_THREADS"] = "2"
 
 
 import cv2
@@ -32,8 +32,8 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 # Limit PyTorch and OpenCV threads to reduce excessive CPU usage on high-core-count processors (like i9 13900K)
-torch.set_num_threads(4)
-cv2.setNumThreads(4)
+torch.set_num_threads(2)
+cv2.setNumThreads(2)
 # ---
 # Config
 # ---
@@ -639,18 +639,19 @@ def _predict_with_tiles_batch(
 
     batch_tensor = torch.stack(tile_list, dim=0)   # (N_tiles, C, H, W) on GPU
 
-    results = model.predict(
-        source=batch_tensor,
-        batch=cfg.batch_size,
-        conf=cfg.base_conf,
-        iou=cfg.iou_threshold,
-        imgsz=tile,
-        augment=cfg.use_tta,
-        half=use_half,
-        device=device,
-        workers=0,
-        verbose=False,
-    )
+    with torch.inference_mode():
+        results = model.predict(
+            source=batch_tensor,
+            batch=cfg.batch_size,
+            conf=cfg.base_conf,
+            iou=cfg.iou_threshold,
+            imgsz=tile,
+            augment=cfg.use_tta,
+            half=use_half,
+            device=device,
+            workers=0,
+            verbose=False,
+        )
 
     # Accumulate box tensors entirely on GPU.
     # r.boxes.xyxy is already a GPU tensor — applying the tile offset here on GPU
@@ -969,7 +970,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         image_chunks = [images[i:i + chunk_size] for i in range(0, len(images), chunk_size)]
         
         # Use ThreadPoolExecutor to overlap I/O and Compute using a Double-Buffer pattern
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             # Submit the very first chunk to the threads
             if image_chunks:
                 next_futures = [executor.submit(_load_and_prep, img) for img in image_chunks[0]]
