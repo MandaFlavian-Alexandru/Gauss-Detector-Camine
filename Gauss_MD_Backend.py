@@ -113,6 +113,7 @@ COLOR_RED    = (0,   0, 255)   # low confidence, worth reviewing
 COLOR_YELLOW = (0, 255, 255)   # clustered — seen from multiple angles
 
 # single shared transformer, no need to recreate it every call
+_stereo70_to_wgs84 = pyproj.Transformer.from_crs("EPSG:3844", "EPSG:4326", always_xy=True)
 
 
 # ---
@@ -448,7 +449,7 @@ def calculate_gps_offset_3d(
     # the flat-ground fallback would give a nonsensical result (negative time).
     # just skip it.
     if ry <= 0:
-        return {"x": None, "y": None, "z": None, "lidar_hit": False,
+        return {"x": None, "y": None, "z": None, "lat": None, "lon": None, "lidar_hit": False,
                 "px_edge_flag": px_edge_flag, "range_m": None,
                 "true_heading_deg": None}
 
@@ -520,7 +521,7 @@ def calculate_gps_offset_3d(
         if t > 30.0:
             # Ray grazes the ground beyond the LiDAR scan range — reject rather than
             # placing the point up to 100 m away outside the point-cloud corridor.
-            return {"x": None, "y": None, "z": None, "lidar_hit": False,
+            return {"x": None, "y": None, "z": None, "lat": None, "lon": None, "lidar_hit": False,
                     "px_edge_flag": px_edge_flag, "range_m": None,
                     "true_heading_deg": true_heading_deg}
         dist_gnd = t * cos_v   # horizontal distance = t * cos(depression_angle)
@@ -530,8 +531,10 @@ def calculate_gps_offset_3d(
             expected_ground_z,
         ], dtype=np.float64)
 
-    return {"x": float(centroid_xyz[0]), "y": float(centroid_xyz[1]), "z": float(centroid_xyz[2]), "lidar_hit": lidar_hit,
-            "px_edge_flag": px_edge_flag, "range_m": range_m,
+    lon, lat = _stereo70_to_wgs84.transform(float(centroid_xyz[0]), float(centroid_xyz[1]))
+    return {"x": float(centroid_xyz[0]), "y": float(centroid_xyz[1]), "z": float(centroid_xyz[2]),
+            "lat": lat, "lon": lon,
+            "lidar_hit": lidar_hit, "px_edge_flag": px_edge_flag, "range_m": range_m,
             "true_heading_deg": true_heading_deg}
 
 
@@ -933,6 +936,8 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                         "x":            geo["x"],
                         "y":            geo["y"],
                         "z":            geo["z"],
+                        "lat":          geo["lat"],
+                        "lon":          geo["lon"],
                         "lidar_hit":    geo["lidar_hit"],
                         "px_edge_flag": geo["px_edge_flag"],
                         "range_m":      geo["range_m"],
@@ -1151,10 +1156,12 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                 if c in df_exp.columns]
         df_exp = df_exp.drop(columns=drop)
 
+        # Export in WGS84 (EPSG:4326) to avoid the EPSG:3844 axis-order ambiguity
+        # that causes QGIS 3.x to swap Northing/Easting, placing Romanian points in Bulgaria.
         gdf = gpd.GeoDataFrame(
             df_exp,
-            geometry=gpd.points_from_xy(df_exp["x"], df_exp["y"], z=df_exp["z"]),
-            crs="EPSG:3844",
+            geometry=gpd.points_from_xy(df_exp["lon"], df_exp["lat"]),
+            crs="EPSG:4326",
         )
 
 

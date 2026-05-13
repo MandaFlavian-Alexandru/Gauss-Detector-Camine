@@ -425,9 +425,16 @@ def generate_final_export(req: FinalExportRequest):
     if drop_cols:
         df.drop(columns=drop_cols, inplace=True)
 
-    geometry = gpd.points_from_xy(df['x'], df['y'], z=df['z'])
-    gdf = gpd.GeoDataFrame(df, geometry=geometry)
-    gdf.set_crs(epsg=3844, inplace=True)
+    # Prefer WGS84 (lon/lat) if available — avoids the EPSG:3844 axis-order issue in QGIS.
+    # Fall back to Stereo70 (x/y) for old briefcases that predate the lat/lon field.
+    if 'lon' in df.columns and 'lat' in df.columns:
+        geometry = gpd.points_from_xy(df['lon'], df['lat'])
+        gdf = gpd.GeoDataFrame(df, geometry=geometry)
+        gdf.set_crs(epsg=4326, inplace=True)
+    else:
+        geometry = gpd.points_from_xy(df['x'], df['y'], z=df['z'])
+        gdf = gpd.GeoDataFrame(df, geometry=geometry)
+        gdf.set_crs(epsg=3844, inplace=True)
     
     base_name = "Export_Camine"
     
