@@ -273,9 +273,10 @@ export default function Home() {
     }
   };
 
-  const handleDownloadBriefcase = () => {
-    if (!activeSessionId) return;
-    window.location.href = `http://localhost:8002/api/download_briefcase?session_id=${activeSessionId}`;
+  const handleDownloadBriefcase = (targetSessionId?: string) => {
+    const idToDownload = targetSessionId || activeSessionId;
+    if (!idToDownload) return;
+    window.location.href = `http://localhost:8002/api/download_briefcase?session_id=${idToDownload}`;
   };
 
   // Lightbox Handlers
@@ -558,12 +559,22 @@ export default function Home() {
                                  </span>
                                )}
                              </div>
-                             <button 
-                               onClick={() => setActiveSessionId(s.id)}
-                               className="bg-brand-primary text-white px-4 py-1.5 rounded text-sm font-bold shadow hover:bg-brand-secondary transition-colors"
-                             >
-                               Review Map Layer
-                             </button>
+                             <div className="flex gap-2">
+                               <button 
+                                 onClick={() => handleDownloadBriefcase(s.id)}
+                                 className="bg-indigo-100 text-indigo-700 hover:bg-indigo-200 px-3 py-1.5 rounded text-xs font-bold transition-colors flex items-center gap-1"
+                                 title="Download Offline Briefcase"
+                               >
+                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                 Briefcase
+                               </button>
+                               <button 
+                                 onClick={() => setActiveSessionId(s.id)}
+                                 className="bg-brand-primary text-white px-4 py-1.5 rounded text-sm font-bold shadow hover:bg-brand-secondary transition-colors"
+                               >
+                                 Review Map Layer
+                               </button>
+                             </div>
                            </div>
                          )}
                        </div>
