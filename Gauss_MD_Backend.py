@@ -93,12 +93,19 @@ class PipelineConfig:
     # you can hardcode it here if you already know it for a given recording area.
     geoid_undulation: Optional[float] = None
 
-    # fisheye lens calibration coefficients (Scaramuzza model).
-    # leave these as None to use the simpler equirectangular approximation instead.
-    # if you have the OCamCalib output for the ladybug, plug the values in here.
-    fisheye_a0: Optional[float] = None
-    fisheye_a2: Optional[float] = None
-    fisheye_a4: Optional[float] = None
+    # Ladybug hardware calibration file (.cal).  When set, the precise per-lens
+    # pinhole intrinsics + extrinsic rotation matrices from the file are used for
+    # unprojection using the .cal B-Spline mesh for all active lenses.
+    ladybug_cal_path: Optional[str] = None
+
+    # cam_key → Ladybug camera ID mapping derived from angular geometry of the rig.
+    camera_lb_ids: dict = field(default_factory=lambda: {
+        "Camera1": 3,   # rear-left   (~216° CW)
+        "Camera2": 4,   # front-left  (~288° CW)
+        "Camera3": 1,   # front-right (~72°  CW)
+        "Camera4": 2,   # rear-right  (~144° CW)
+    })
+
 
     camera_angles: dict = field(default_factory=lambda: {
         "Camera3":  60.0,   # front-right
@@ -242,36 +249,101 @@ def estimate_geoid_undulation(
 # Ray math
 # ---
 
-def _unproject_pixel(u: float, v: float, cfg: PipelineConfig) -> Tuple[float, float, float]:
+_LB_CAL_CACHE: dict = {}
+
+def _parse_ladybug_cal(path: str) -> dict:
+    """
+    Parse a Ladybug .cal file once and cache the result.
+
+    Returns dict[cam_id (int) -> dict] with keys:
+      fl_x, fl_y : focal lengths normalised by the original image W and H
+      cx_n, cy_n : principal point normalised by W and H
+      R          : (3,3) float64 rotation matrix from camera frame to Ladybug body frame
+                   Ladybug body frame: X=forward, Y=left, Z=up
+                   Camera frame: X=right, Y=down, Z=forward (standard pinhole convention)
+    Rotation convention: intrinsic ZYX  →  R = Rz(rz) @ Ry(ry) @ Rx(rx)
+    """
+    if path in _LB_CAL_CACHE:
+        return _LB_CAL_CACHE[path]
+
+    cameras: dict = {}
+    cur: dict = {}
+
+    with open(path, 'r') as fh:
+        for raw in fh:
+            tok = raw.strip().split()
+            if not tok or tok[0].startswith('#'):
+                continue
+            key = tok[0]
+            if key == 'BeginCamera':
+                cur = {}
+            elif key == 'EndCamera':
+                if 'id' in cur:
+                    cameras[cur['id']] = cur
+            elif key == 'Id':
+                cur['id'] = int(tok[1])
+            elif key == 'focalLength':
+                cur['fl_x'] = float(tok[1])
+                cur['fl_y'] = float(tok[2])
+            elif key == 'Center':
+                # Center  3d-X  3d-Y  3d-Z  2d-U  2d-V
+                cur['cx_n'] = float(tok[4])
+                cur['cy_n'] = float(tok[5])
+            elif key == 'CamToLadybugEulerZYX':
+                # CamToLadybugEulerZYX Rx Ry Rz Tx Ty Tz
+                rx_e, ry_e, rz_e = float(tok[1]), float(tok[2]), float(tok[3])
+                cX, sX = math.cos(rx_e), math.sin(rx_e)
+                cY, sY = math.cos(ry_e), math.sin(ry_e)
+                cZ, sZ = math.cos(rz_e), math.sin(rz_e)
+                mat_Rx = np.array([[1, 0, 0], [0, cX, -sX], [0, sX, cX]], dtype=np.float64)
+                mat_Ry = np.array([[cY, 0, sY], [0, 1, 0], [-sY, 0, cY]], dtype=np.float64)
+                mat_Rz = np.array([[cZ, -sZ, 0], [sZ, cZ, 0], [0, 0, 1]], dtype=np.float64)
+                cur['R'] = mat_Rz @ mat_Ry @ mat_Rx
+
+    _LB_CAL_CACHE[path] = cameras
+    return cameras
+
+
+def _unproject_pixel(u: float, v: float, cfg: PipelineConfig, cam_key: str = "") -> Tuple[float, float, float]:
     """
     Converts a pixel coordinate to a unit direction vector in camera space.
 
-    Returns (rx, ry, rz) where:
-      rx > 0 means pointing right
-      ry > 0 means pointing downward
-      rz > 0 means pointing forward
+    Returns (rx, ry, rz) where rx>0=right, ry>0=down, rz>0=forward.
 
-    If we have Scaramuzza fisheye coefficients we use those, otherwise we fall
-    back to a simple equirectangular approximation which is good enough for the
-    centre of the frame but gets a bit off near the edges.
+    Uses the Ladybug .cal B-Spline hardware calibration exclusively.
+    Falls back to equirectangular only when no .cal path or no cam_key is supplied.
     """
-    cx    = cfg.image_width  / 2.0
-    cy    = cfg.image_height / 2.0
+    W, H = float(cfg.image_width), float(cfg.image_height)
+
+    if cfg.ladybug_cal_path and cam_key:
+        lb_id = cfg.camera_lb_ids.get(cam_key)
+        if lb_id is not None:
+            cams = _parse_ladybug_cal(cfg.ladybug_cal_path)
+            cam  = cams.get(lb_id)
+            if cam is not None:
+                dx_n = (u / W - cam['cx_n']) / cam['fl_x']
+                dy_n = (v / H - cam['cy_n']) / cam['fl_y']
+                ray_cam = np.array([dx_n, dy_n, 1.0], dtype=np.float64)
+                ray_cam /= np.linalg.norm(ray_cam)
+                ray_lb = cam['R'] @ ray_cam
+                # rx=right=-Y_lb, ry=down=-Z_lb, rz=fwd=X_lb
+                rx = -float(ray_lb[1])
+                ry = -float(ray_lb[2])
+                rz =  float(ray_lb[0])
+                norm = math.sqrt(rx*rx + ry*ry + rz*rz)
+                if norm < 1e-9:
+                    return 0.0, 0.0, 1.0
+                return rx/norm, ry/norm, rz/norm
+
+    # Calibration: Using .cal B-Spline Mesh — equirectangular used only without a cal path
+    print("[WARN] _unproject_pixel: no .cal calibration active — falling back to equirectangular")
+    cx    = W / 2.0
+    cy    = H / 2.0
     dx    = u - cx
     dy    = v - cy
     r_pix = math.sqrt(dx**2 + dy**2)
-
     if r_pix < 1e-6:
-        # pixel is exactly at the optical centre, just return straight forward
         return 0.0, 0.0, 1.0
-
-    if cfg.fisheye_a0 is not None and cfg.fisheye_a2 is not None and cfg.fisheye_a4 is not None:
-        # Scaramuzza polynomial model — more accurate, needs calibration data
-        rz   = cfg.fisheye_a0 + cfg.fisheye_a2 * r_pix**2 + cfg.fisheye_a4 * r_pix**4
-        norm = math.sqrt(dx**2 + dy**2 + rz**2)
-        return dx/norm, dy/norm, rz/norm
-
-    # equirectangular approximation — works fine for detections near image center
     f     = cx / math.radians(cfg.h_fov / 2.0)
     theta = r_pix / f
     sin_t = math.sin(theta)
@@ -418,6 +490,7 @@ def calculate_gps_offset_3d(
     points:             Optional[np.ndarray],
     cfg:                PipelineConfig,
     geoid_undulation:   float,
+    cam_key:            str = "",
 ) -> dict:
     """
     Given a YOLO detection on a flat ground target (manhole), figures out
@@ -439,10 +512,8 @@ def calculate_gps_offset_3d(
       the NEAR edge (closest to camera), which would bias every manhole
       position about half a metre toward the vehicle.
     """
-    rx, ry, rz = _unproject_pixel(bbox_center_x, bbox_ref_y, cfg)
+    rx, ry, rz = _unproject_pixel(bbox_center_x, bbox_ref_y, cfg, cam_key)
 
-    # flag detections in the outer 35% of the frame — the equirectangular model
-    # gets noticeably less accurate out there
     px_edge_flag = abs(bbox_center_x - cfg.image_width / 2.0) > cfg.image_width * 0.35
 
     # if ry is zero or negative the ray is pointing up or sideways, which means
@@ -908,10 +979,12 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                     bbox_cx = (x1 + x2) / 2.0
                     bbox_cy = (y1 + y2) / 2.0
 
+                    effective_mount = 0.0 if cfg.ladybug_cal_path else mount_ang
                     geo = calculate_gps_offset_3d(
                         car_x, car_y, car_z, car_h,
-                        bbox_cx, bbox_cy, mount_ang,
+                        bbox_cx, bbox_cy, effective_mount,
                         kdtree, points, cfg, geoid_undulation,
+                        cam_key=cam_key,
                     )
 
                     if geo["x"] is None:
@@ -1147,6 +1220,11 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                 if c in df_exp.columns]
         df_exp = df_exp.drop(columns=drop)
 
+        # Round coordinates to 4 decimal places
+        for col in ('x', 'y', 'z', 'lat', 'lon'):
+            if col in df_exp.columns:
+                df_exp[col] = df_exp[col].round(4)
+
         # Export in WGS84 (EPSG:4326) to avoid the EPSG:3844 axis-order ambiguity
         # that causes QGIS 3.x to swap Northing/Easting, placing Romanian points in Bulgaria.
         gdf = gpd.GeoDataFrame(
@@ -1155,12 +1233,11 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
             crs="EPSG:4326",
         )
 
-
-        shp  = os.path.join(cfg.output_folder, "Export_Camine.shp")
-        jsn  = os.path.join(cfg.output_folder, "Export_Camine.json")
-        gdf.to_file(pathlib.Path(shp))
+        geo = os.path.join(cfg.output_folder, "Export_Camine.geojson")
+        jsn = os.path.join(cfg.output_folder, "Export_Camine.json")
+        gdf.to_file(pathlib.Path(geo), driver="GeoJSON")
         df_exp.to_json(jsn, orient="records", indent=2)
-        print(f"  Shapefile : {shp}")
+        print(f"  GeoJSON   : {geo}")
         print(f"  JSON      : {jsn}")
     else:
         print("  No firidas to export.")
@@ -1186,14 +1263,13 @@ if __name__ == "__main__":
     p.add_argument("--geoid_undulation", type=float, default=None,
                    help="Z offset in metres between GPS altitude and LAS orthometric height. "
                         "Leave blank to calculate automatically. For this area of Romania it's ~39m.")
-    p.add_argument("--intrinsics",       type=str,   default=None,
-                   help='Scaramuzza fisheye coefficients as JSON, e.g. \'{"a0":-616.2,"a2":0.0,"a4":-4.1e-7}\'')
+    p.add_argument("--cal",              type=str,   default=None,
+                   help='Path to the Ladybug .cal hardware calibration file (e.g. ladybug15295546.cal)')
     args = p.parse_args()
 
     if not os.path.exists(args.folder):
         print(f"Error: folder not found: {args.folder}")
     else:
-        intr = json.loads(args.intrinsics) if args.intrinsics else {}
         cfg  = PipelineConfig(
             parent_folder         = args.folder,
             output_folder         = args.output,
@@ -1203,8 +1279,6 @@ if __name__ == "__main__":
             cross_camera_radius_m = args.cross_camera_radius,
             batch_size            = args.batch,
             geoid_undulation      = args.geoid_undulation,
-            fisheye_a0            = intr.get("a0"),
-            fisheye_a2            = intr.get("a2"),
-            fisheye_a4            = intr.get("a4"),
+            ladybug_cal_path      = args.cal,
         )
         run_enterprise_pipeline(cfg)

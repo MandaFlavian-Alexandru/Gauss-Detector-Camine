@@ -409,30 +409,27 @@ def generate_final_export(req: FinalExportRequest):
         return {"status": "error", "message": "No verified detections to export."}
         
     df = pd.DataFrame(final_data)
-    
-    # Inject required empty columns for schema compatibility
+
+    # Round coordinates to 4 decimal places
+    for col in ("x", "y", "z", "lat", "lon"):
+        if col in df.columns:
+            df[col] = df[col].round(4)
+
+    # Inject required empty columns for Camine schema
     null_cols = ["Id_Camin", "CT", "CR1", "CR2", "CR3", "CR4"]
     for col in null_cols:
         df[col] = ""
 
-    # Retain specifically requested metadata columns.
-    # NOTE: lat/lon MUST be retained — without them the geometry below falls back
-    # to Stereo70 (EPSG:3844), which has an [N, E] axis-order definition that QGIS
-    # 3.x honors. The shapefile stores points as [X, Y] though, which the tool then
-    # reads as [northing, easting] and reprojects to the wrong location, placing
-    # Romanian points roughly 3° south of where they should be (in northern Bulgaria).
     retain_cols = [
         "image", "x", "y", "z", "lat", "lon", "lidar_hit", "px_edge_flag",
         "range_m", "conf", "cam_key",
     ] + null_cols
-    
-    # Drop columns not in retain list to ensure strict schema enforcement
+
     drop_cols = [c for c in df.columns if c not in retain_cols]
     if drop_cols:
         df.drop(columns=drop_cols, inplace=True)
 
-    # Prefer WGS84 (lon/lat) if available — avoids the EPSG:3844 axis-order issue in QGIS.
-    # Fall back to Stereo70 (x/y) for old briefcases that predate the lat/lon field.
+    # Prefer WGS84 (lon/lat) — avoids the EPSG:3844 axis-order swap in QGIS 3.x.
     if 'lon' in df.columns and 'lat' in df.columns:
         geometry = gpd.points_from_xy(df['lon'], df['lat'])
         gdf = gpd.GeoDataFrame(df, geometry=geometry)
@@ -441,16 +438,16 @@ def generate_final_export(req: FinalExportRequest):
         geometry = gpd.points_from_xy(df['x'], df['y'], z=df['z'])
         gdf = gpd.GeoDataFrame(df, geometry=geometry)
         gdf.set_crs(epsg=3844, inplace=True)
-    
+
     base_name = "Export_Camine"
-    
+
     json_path = os.path.join(st["current_output_dir"], f"{base_name}.json")
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(final_data, f)
-        
-    shp_path = os.path.join(st["current_output_dir"], f"{base_name}.shp")
-    gdf.to_file(pathlib.Path(shp_path))
-    
+
+    geo_path = os.path.join(st["current_output_dir"], f"{base_name}.geojson")
+    gdf.to_file(pathlib.Path(geo_path), driver="GeoJSON")
+
     return {"status": "success"}
 
 @app.get("/api/download_shapefile")
@@ -459,16 +456,16 @@ def download_shapefile(session_id: str):
     target_dir = st["current_output_dir"]
     base_name = "Export_Camine"
     
-    if not target_dir or not os.path.exists(os.path.join(target_dir, f"{base_name}.shp")):
-        return Response(content="Shapefile not generated yet", status_code=404)
-        
+    if not target_dir or not os.path.exists(os.path.join(target_dir, f"{base_name}.geojson")):
+        return Response(content="GeoJSON not generated yet", status_code=404)
+
     desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
     final_output_dir = os.path.join(desktop_path, f"Gauss_Results_{session_id}")
     os.makedirs(final_output_dir, exist_ok=True)
-    
+
     zip_path = os.path.join(final_output_dir, f"{base_name}.zip")
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg', '.json']:
+        for ext in ['.geojson', '.json']:
             file_path = os.path.join(target_dir, f"{base_name}{ext}")
             if os.path.exists(file_path):
                 import shutil
