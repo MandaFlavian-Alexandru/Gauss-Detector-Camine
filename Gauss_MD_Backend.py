@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import pathlib
+import tempfile
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -26,6 +28,7 @@ import pandas as pd
 import pyproj
 import torch
 import torchvision
+import scipy.interpolate
 from scipy.spatial import KDTree
 from shapely.geometry import Point
 from tqdm import tqdm
@@ -248,95 +251,433 @@ def estimate_geoid_undulation(
 # ---
 # Ray math
 # ---
+#
+# Ladybug 5+ calibration constants — properties of the camera hardware,
+# fixed for a given serial number. The .cal file encodes intrinsics and
+# distortion for a 2448x2048 sensor frame per camera.
+LADYBUG_SENSOR_W      = 2448
+LADYBUG_SENSOR_H      = 2048
+LADYBUG_SPLINE_DEGREE = 3      # cubic, indicated by 4-fold repeated end knots
 
-_LB_CAL_CACHE: dict = {}
+_LB_CAL_CACHE: dict = {}  # path -> {'cameras': {...}, 'warps': {...}}
+_LB_LUT_CACHE: dict = {}  # (path, lb_id) -> ndarray of shape (W, H, 3)
+
 
 def _parse_ladybug_cal(path: str) -> dict:
     """
-    Parse a Ladybug .cal file once and cache the result.
+    Parse a Ladybug .cal file fully — cameras AND warp blocks — and validate
+    everything aggressively. Cached so this only happens once per run.
 
-    Returns dict[cam_id (int) -> dict] with keys:
-      fl_x, fl_y : focal lengths normalised by the original image W and H
-      cx_n, cy_n : principal point normalised by W and H
-      R          : (3,3) float64 rotation matrix from camera frame to Ladybug body frame
-                   Ladybug body frame: X=forward, Y=left, Z=up
-                   Camera frame: X=right, Y=down, Z=forward (standard pinhole convention)
-    Rotation convention: intrinsic ZYX  →  R = Rz(rz) @ Ry(ry) @ Rx(rx)
+    Parses:
+      - Per-camera intrinsics:  focalLength, Center (principal point)
+      - Per-camera extrinsics:  CamToLadybugEulerZYX
+      - Per-camera warp IDs:    RectifiedSpline, DistortedSpline
+      - Tensor-product B-spline warp blocks: knots, coefficient grids
+
+    Validates (raises ValueError if anything is off):
+      - File exists and is readable
+      - Every camera has all required fields
+      - Focal lengths are non-zero (catches corrupt cal files)
+      - Rotation matrices are orthonormal (det == 1, R @ R.T == I)
+      - Warp ID references resolve to defined warp blocks
+      - Knot count matches the cubic spline relation N_knots == N_coefs + degree + 1
+
+    Returns:
+        {
+          'cameras': { lb_id (int) -> {
+              'fl_x', 'fl_y', 'cx_n', 'cy_n', 'R',
+              'rect_warp_u_id', 'rect_warp_v_id',
+              'dist_warp_u_id', 'dist_warp_v_id',
+          }, ... },
+          'warps': { warp_id (int) -> {
+              'knots_x', 'knots_y', 'coefs_2d', 'kx', 'ky',
+          }, ... },
+        }
+
+    Cam frame convention:    X=right, Y=down, Z=forward (standard pinhole)
+    Ladybug body convention: X=forward, Y=left, Z=up
+    Rotation R takes camera frame → Ladybug body frame.
     """
     if path in _LB_CAL_CACHE:
         return _LB_CAL_CACHE[path]
 
-    cameras: dict = {}
-    cur: dict = {}
+    if not path or not os.path.isfile(path):
+        raise ValueError(f"Ladybug calibration file not found: {path!r}")
+
+    cameras: dict  = {}
+    warps:   dict  = {}
+    cur_cam: dict  = {}
+    cur_warp: dict = {}
+    cur_block      = None
+    reading_coefs  = False
 
     with open(path, 'r') as fh:
         for raw in fh:
-            tok = raw.strip().split()
-            if not tok or tok[0].startswith('#'):
+            line = raw.strip()
+            if not line or line.startswith('#'):
                 continue
+            tok = line.split()
             key = tok[0]
-            if key == 'BeginCamera':
-                cur = {}
-            elif key == 'EndCamera':
-                if 'id' in cur:
-                    cameras[cur['id']] = cur
-            elif key == 'Id':
-                cur['id'] = int(tok[1])
-            elif key == 'focalLength':
-                cur['fl_x'] = float(tok[1])
-                cur['fl_y'] = float(tok[2])
-            elif key == 'Center':
-                # Center  3d-X  3d-Y  3d-Z  2d-U  2d-V
-                cur['cx_n'] = float(tok[4])
-                cur['cy_n'] = float(tok[5])
-            elif key == 'CamToLadybugEulerZYX':
-                # CamToLadybugEulerZYX Rx Ry Rz Tx Ty Tz
-                rx_e, ry_e, rz_e = float(tok[1]), float(tok[2]), float(tok[3])
-                cX, sX = math.cos(rx_e), math.sin(rx_e)
-                cY, sY = math.cos(ry_e), math.sin(ry_e)
-                cZ, sZ = math.cos(rz_e), math.sin(rz_e)
-                mat_Rx = np.array([[1, 0, 0], [0, cX, -sX], [0, sX, cX]], dtype=np.float64)
-                mat_Ry = np.array([[cY, 0, sY], [0, 1, 0], [-sY, 0, cY]], dtype=np.float64)
-                mat_Rz = np.array([[cZ, -sZ, 0], [sZ, cZ, 0], [0, 0, 1]], dtype=np.float64)
-                cur['R'] = mat_Rz @ mat_Ry @ mat_Rx
 
-    _LB_CAL_CACHE[path] = cameras
-    return cameras
+            if key == 'BeginCamera':
+                cur_cam = {}
+                cur_block = 'camera'
+                continue
+            if key == 'EndCamera':
+                if 'id' in cur_cam:
+                    cameras[cur_cam['id']] = cur_cam
+                cur_cam   = {}
+                cur_block = None
+                continue
+            if key == 'BeginWarp':
+                cur_warp      = {'_coef_buffer': []}
+                cur_block     = 'warp'
+                reading_coefs = False
+                continue
+            if key == 'EndWarp':
+                if 'id' in cur_warp:
+                    nx, ny = cur_warp.get('num_coefs', (0, 0))
+                    buf    = cur_warp.pop('_coef_buffer')
+                    if nx == 0 or ny == 0:
+                        raise ValueError(f"Warp {cur_warp['id']}: NumberCoefs missing")
+                    if len(buf) != nx * ny:
+                        raise ValueError(
+                            f"Warp {cur_warp['id']}: expected {nx*ny} coefs "
+                            f"({nx} x {ny}), got {len(buf)}"
+                        )
+                    cur_warp['coefs_2d'] = np.array(buf, dtype=np.float64).reshape(nx, ny)
+                    cur_warp['kx']       = LADYBUG_SPLINE_DEGREE
+                    cur_warp['ky']       = LADYBUG_SPLINE_DEGREE
+                    warps[cur_warp['id']] = cur_warp
+                cur_warp      = {}
+                cur_block     = None
+                reading_coefs = False
+                continue
+
+            if cur_block == 'camera':
+                if   key == 'Id':               cur_cam['id']   = int(tok[1])
+                elif key == 'focalLength':      cur_cam['fl_x'] = float(tok[1]); cur_cam['fl_y'] = float(tok[2])
+                elif key == 'Center':           cur_cam['cx_n'] = float(tok[4]); cur_cam['cy_n'] = float(tok[5])
+                elif key == 'RectifiedSpline':  cur_cam['rect_warp_u_id'] = int(tok[1]); cur_cam['rect_warp_v_id'] = int(tok[2])
+                elif key == 'DistortedSpline':  cur_cam['dist_warp_u_id'] = int(tok[1]); cur_cam['dist_warp_v_id'] = int(tok[2])
+                elif key == 'CamToLadybugEulerZYX':
+                    cur_cam['euler'] = (float(tok[1]), float(tok[2]), float(tok[3]))
+                continue
+
+            if cur_block == 'warp':
+                if key == 'Id':
+                    cur_warp['id'] = int(tok[1])
+                    reading_coefs = False
+                elif key == 'NumberKnots':
+                    cur_warp['num_knots'] = int(tok[1])
+                    reading_coefs = False
+                elif key == 'KnotsX':
+                    cur_warp['knots_x'] = np.array([float(x) for x in tok[1:]], dtype=np.float64)
+                    reading_coefs = False
+                elif key == 'KnotsY':
+                    cur_warp['knots_y'] = np.array([float(x) for x in tok[1:]], dtype=np.float64)
+                    reading_coefs = False
+                elif key == 'NumberCoefs':
+                    cur_warp['num_coefs'] = (int(tok[1]), int(tok[2]))
+                    reading_coefs = False
+                elif key == 'Coefs':
+                    reading_coefs = True
+                    cur_warp['_coef_buffer'].extend(float(x) for x in tok[1:])
+                elif reading_coefs:
+                    cur_warp['_coef_buffer'].extend(float(x) for x in tok)
+                continue
+
+    if not cameras:
+        raise ValueError(f"No camera blocks parsed from {path}")
+
+    for cam_id, cam in cameras.items():
+        for req in ('fl_x', 'fl_y', 'cx_n', 'cy_n', 'euler',
+                    'rect_warp_u_id', 'rect_warp_v_id'):
+            if req not in cam:
+                raise ValueError(f"Camera {cam_id}: missing required field '{req}'")
+
+        if cam['fl_x'] == 0.0 or cam['fl_y'] == 0.0:
+            raise ValueError(f"Camera {cam_id}: focal length is zero — corrupt cal file")
+
+        rx_e, ry_e, rz_e = cam['euler']
+        cX, sX = math.cos(rx_e), math.sin(rx_e)
+        cY, sY = math.cos(ry_e), math.sin(ry_e)
+        cZ, sZ = math.cos(rz_e), math.sin(rz_e)
+        mat_Rx = np.array([[1, 0, 0], [0, cX, -sX], [0, sX, cX]], dtype=np.float64)
+        mat_Ry = np.array([[cY, 0, sY], [0, 1, 0], [-sY, 0, cY]], dtype=np.float64)
+        mat_Rz = np.array([[cZ, -sZ, 0], [sZ, cZ, 0], [0, 0, 1]], dtype=np.float64)
+        R = mat_Rz @ mat_Ry @ mat_Rx
+
+        det = float(np.linalg.det(R))
+        if abs(det - 1.0) > 1e-6:
+            raise ValueError(
+                f"Camera {cam_id}: rotation matrix not orthonormal "
+                f"(det={det:.6f}, expected 1.0)"
+            )
+        if not np.allclose(R @ R.T, np.eye(3), atol=1e-6):
+            raise ValueError(
+                f"Camera {cam_id}: rotation matrix is not orthogonal (R @ R.T != I)"
+            )
+        cam['R'] = R
+
+    for cam_id, cam in cameras.items():
+        for ref_key in ('rect_warp_u_id', 'rect_warp_v_id'):
+            wid = cam[ref_key]
+            if wid not in warps:
+                raise ValueError(
+                    f"Camera {cam_id}: references undefined warp ID {wid} ({ref_key})"
+                )
+
+    for warp_id, warp in warps.items():
+        for req in ('knots_x', 'knots_y', 'num_coefs', 'coefs_2d'):
+            if req not in warp:
+                raise ValueError(f"Warp {warp_id}: missing '{req}'")
+        kx, ky = warp['kx'], warp['ky']
+        nx, ny = warp['num_coefs']
+        if len(warp['knots_x']) != nx + kx + 1:
+            raise ValueError(
+                f"Warp {warp_id}: knots_x has {len(warp['knots_x'])} entries, "
+                f"expected {nx + kx + 1} (num_coefs_x + kx + 1)"
+            )
+        if len(warp['knots_y']) != ny + ky + 1:
+            raise ValueError(
+                f"Warp {warp_id}: knots_y has {len(warp['knots_y'])} entries, "
+                f"expected {ny + ky + 1} (num_coefs_y + ky + 1)"
+            )
+
+    result = {'cameras': cameras, 'warps': warps}
+    _LB_CAL_CACHE[path] = result
+    return result
+
+
+def _lut_disk_path(cal_path: str, lb_id: int) -> str:
+    """
+    Path on disk where a per-camera LUT is cached. The filename includes a hash
+    of the .cal file's contents so that if the cal file ever changes, the cache
+    is automatically invalidated.
+    """
+    with open(cal_path, 'rb') as fh:
+        cal_hash = hashlib.md5(fh.read()).hexdigest()[:12]
+    cache_dir = os.path.join(tempfile.gettempdir(), 'gauss_ladybug_lut_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"lut_{cal_hash}_cam{lb_id}.npy")
+
+
+def _build_ladybug_lut(cal_path: str, lb_id: int) -> np.ndarray:
+    """
+    Build (or load from disk cache) a (sensor_w, sensor_h, 3) lookup table
+    that maps every DISTORTED sensor pixel to its corresponding unit ray
+    vector in our working frame: (rx=right, ry=down, rz=forward).
+
+    Steps for each sensor pixel (u, v):
+      1. Normalise (u, v) to (0..1) over the sensor dimensions
+      2. Evaluate the RectifiedSpline B-spline at that normalised location to
+         get the corresponding rectified normalised position (u_r, v_r).
+      3. Apply linear pinhole math on the rectified coords using the cal file's
+         focal length and principal point to get a ray in camera frame.
+      4. Rotate camera frame → Ladybug body frame using R from CamToLadybugEulerZYX.
+      5. Convert Ladybug body frame (X=forward, Y=left, Z=up) to working frame
+         (rx=right, ry=down, rz=forward): rx=-Y_lb, ry=-Z_lb, rz=+X_lb.
+      6. Normalise.
+    """
+    cache_key = (cal_path, lb_id)
+    if cache_key in _LB_LUT_CACHE:
+        return _LB_LUT_CACHE[cache_key]
+
+    disk_path = _lut_disk_path(cal_path, lb_id)
+    if os.path.isfile(disk_path):
+        try:
+            lut = np.load(disk_path)
+            if lut.shape == (LADYBUG_SENSOR_W, LADYBUG_SENSOR_H, 3):
+                _LB_LUT_CACHE[cache_key] = lut
+                return lut
+        except Exception:
+            pass
+
+    data = _parse_ladybug_cal(cal_path)
+    cam  = data['cameras'].get(lb_id)
+    if cam is None:
+        raise ValueError(
+            f"Camera id {lb_id} not present in calibration file {cal_path}"
+        )
+
+    warp_u = data['warps'][cam['rect_warp_u_id']]
+    warp_v = data['warps'][cam['rect_warp_v_id']]
+
+    tck_u = (
+        warp_u['knots_x'], warp_u['knots_y'],
+        warp_u['coefs_2d'].flatten(),
+        warp_u['kx'], warp_u['ky'],
+    )
+    tck_v = (
+        warp_v['knots_x'], warp_v['knots_y'],
+        warp_v['coefs_2d'].flatten(),
+        warp_v['kx'], warp_v['ky'],
+    )
+
+    sensor_w, sensor_h = LADYBUG_SENSOR_W, LADYBUG_SENSOR_H
+    u_grid_n = np.arange(sensor_w, dtype=np.float64) / (sensor_w - 1)
+    v_grid_n = np.arange(sensor_h, dtype=np.float64) / (sensor_h - 1)
+
+    print(f"        evaluating rectification spline for camera {lb_id}...")
+    u_rect_grid = scipy.interpolate.bisplev(u_grid_n, v_grid_n, tck_u)
+    v_rect_grid = scipy.interpolate.bisplev(u_grid_n, v_grid_n, tck_v)
+
+    if (np.abs(u_rect_grid) > 5).any() or (np.abs(v_rect_grid) > 5).any():
+        raise ValueError(
+            f"Camera {lb_id}: rectification spline output out of plausible range "
+            f"(u in [{u_rect_grid.min():.2f}, {u_rect_grid.max():.2f}], "
+            f"v in [{v_rect_grid.min():.2f}, {v_rect_grid.max():.2f}]). "
+            "FITPACK coefficient ordering may be wrong."
+        )
+
+    fl_x, fl_y = cam['fl_x'], cam['fl_y']
+    cx_n, cy_n = cam['cx_n'], cam['cy_n']
+    dx_cam = (u_rect_grid - cx_n) / fl_x
+    dy_cam = (v_rect_grid - cy_n) / fl_y
+
+    rays_cam = np.stack(
+        [dx_cam, dy_cam, np.ones_like(dx_cam)],
+        axis=-1,
+    )
+    norms    = np.linalg.norm(rays_cam, axis=-1, keepdims=True)
+    rays_cam = rays_cam / np.maximum(norms, 1e-12)
+
+    R       = cam['R']
+    rays_lb = rays_cam @ R.T
+
+    rays_work = np.stack([
+        -rays_lb[..., 1],   # rx = -Y_lb
+        -rays_lb[..., 2],   # ry = -Z_lb
+         rays_lb[..., 0],   # rz = +X_lb
+    ], axis=-1)
+    norms     = np.linalg.norm(rays_work, axis=-1, keepdims=True)
+    rays_work = rays_work / np.maximum(norms, 1e-12)
+
+    cu, cv     = sensor_w // 2, sensor_h // 2
+    center_ray = rays_work[cu, cv]
+    print(f"        camera {lb_id} centre-pixel ray: "
+          f"({center_ray[0]:+.3f}, {center_ray[1]:+.3f}, {center_ray[2]:+.3f})")
+
+    rays_work = rays_work.astype(np.float32)
+
+    try:
+        np.save(disk_path, rays_work)
+    except Exception as e:
+        print(f"        [warn] couldn't write LUT cache to {disk_path}: {e}")
+
+    _LB_LUT_CACHE[cache_key] = rays_work
+    return rays_work
+
+
+def get_ray_for_pixel(u: float, v: float, cfg: PipelineConfig, cam_key: str) -> Tuple[float, float, float]:
+    """
+    Returns a unit ray vector (rx, ry, rz) in the working frame for a pixel
+    in the current processing resolution.
+
+    Steps:
+      1. Scale (u, v) from (image_width, image_height) → (sensor_w, sensor_h).
+      2. Bilinear-interpolate the camera's pre-built LUT at that location.
+      3. Re-normalise (averaging unit vectors mildly shortens them).
+
+    No silent fallbacks — if the cal isn't usable, this raises ValueError.
+    """
+    if not cfg.ladybug_cal_path:
+        raise ValueError(
+            "get_ray_for_pixel called but no ladybug_cal_path configured in cfg"
+        )
+
+    lb_id = cfg.camera_lb_ids.get(cam_key)
+    if lb_id is None:
+        raise ValueError(
+            f"No Ladybug camera ID mapped for camera key '{cam_key}'. "
+            f"Configured keys: {list(cfg.camera_lb_ids.keys())}"
+        )
+
+    lut      = _build_ladybug_lut(cfg.ladybug_cal_path, lb_id)
+    sensor_w = LADYBUG_SENSOR_W
+    sensor_h = LADYBUG_SENSOR_H
+    img_w    = float(cfg.image_width)
+    img_h    = float(cfg.image_height)
+
+    u_sensor = u * (sensor_w - 1) / max(img_w - 1, 1.0)
+    v_sensor = v * (sensor_h - 1) / max(img_h - 1, 1.0)
+    u_sensor = max(0.0, min(float(sensor_w - 1), u_sensor))
+    v_sensor = max(0.0, min(float(sensor_h - 1), v_sensor))
+
+    u0 = int(np.floor(u_sensor))
+    v0 = int(np.floor(v_sensor))
+    u1 = min(u0 + 1, sensor_w - 1)
+    v1 = min(v0 + 1, sensor_h - 1)
+    fu = u_sensor - u0
+    fv = v_sensor - v0
+
+    r00 = lut[u0, v0]
+    r01 = lut[u0, v1]
+    r10 = lut[u1, v0]
+    r11 = lut[u1, v1]
+
+    r_v0 = r00 * (1.0 - fu) + r10 * fu
+    r_v1 = r01 * (1.0 - fu) + r11 * fu
+    ray  = r_v0 * (1.0 - fv) + r_v1 * fv
+
+    n = float(np.linalg.norm(ray))
+    if n < 1e-9:
+        raise ValueError(
+            f"Interpolated ray vanished at sensor pixel ({u_sensor:.1f}, {v_sensor:.1f}). "
+            "LUT may be corrupted."
+        )
+    return float(ray[0] / n), float(ray[1] / n), float(ray[2] / n)
+
+
+def precompute_ladybug_luts(cfg: PipelineConfig) -> None:
+    """
+    Force-build the LUT for every camera configured in cfg.camera_lb_ids before
+    the main loop starts. This pays the spline-evaluation cost once up-front
+    instead of as a stall on the first detection per camera.
+    """
+    if not cfg.ladybug_cal_path:
+        return
+    t0 = time.time()
+    print("[PHASE 1] Loading Ladybug calibration...")
+    data = _parse_ladybug_cal(cfg.ladybug_cal_path)
+    print(f"        parsed in {time.time()-t0:.2f}s — "
+          f"{len(data['cameras'])} cameras, {len(data['warps'])} warp blocks")
+
+    seen: set = set()
+    for cam_key, lb_id in cfg.camera_lb_ids.items():
+        if lb_id in seen or lb_id not in data['cameras']:
+            continue
+        seen.add(lb_id)
+        t1 = time.time()
+        _build_ladybug_lut(cfg.ladybug_cal_path, lb_id)
+        print(f"        LUT ready for {cam_key} (lb_id {lb_id}) "
+              f"in {time.time()-t1:.2f}s")
 
 
 def _unproject_pixel(u: float, v: float, cfg: PipelineConfig, cam_key: str = "") -> Tuple[float, float, float]:
     """
-    Converts a pixel coordinate to a unit direction vector in camera space.
-
+    Converts a pixel coordinate to a unit direction vector in the working frame.
     Returns (rx, ry, rz) where rx>0=right, ry>0=down, rz>0=forward.
 
-    Uses the Ladybug .cal B-Spline hardware calibration exclusively.
-    Falls back to equirectangular only when no .cal path or no cam_key is supplied.
+    If the Ladybug .cal calibration is configured, uses the LUT-backed
+    get_ray_for_pixel for full B-spline-accurate unprojection. Failures here
+    raise ValueError — we deliberately do NOT silently fall back to equirectangular,
+    because that produced "looks plausible but is wrong" results when the cal
+    was misconfigured.
+
+    The equirectangular branch is only entered when no .cal is configured at all.
     """
-    W, H = float(cfg.image_width), float(cfg.image_height)
+    if cfg.ladybug_cal_path:
+        if not cam_key:
+            raise ValueError(
+                "_unproject_pixel: ladybug_cal_path is set but no cam_key supplied. "
+                "Every call site must pass cam_key when calibration is active."
+            )
+        return get_ray_for_pixel(u, v, cfg, cam_key)
 
-    if cfg.ladybug_cal_path and cam_key:
-        lb_id = cfg.camera_lb_ids.get(cam_key)
-        if lb_id is not None:
-            cams = _parse_ladybug_cal(cfg.ladybug_cal_path)
-            cam  = cams.get(lb_id)
-            if cam is not None:
-                dx_n = (u / W - cam['cx_n']) / cam['fl_x']
-                dy_n = (v / H - cam['cy_n']) / cam['fl_y']
-                ray_cam = np.array([dx_n, dy_n, 1.0], dtype=np.float64)
-                ray_cam /= np.linalg.norm(ray_cam)
-                ray_lb = cam['R'] @ ray_cam
-                # rx=right=-Y_lb, ry=down=-Z_lb, rz=fwd=X_lb
-                rx = -float(ray_lb[1])
-                ry = -float(ray_lb[2])
-                rz =  float(ray_lb[0])
-                norm = math.sqrt(rx*rx + ry*ry + rz*rz)
-                if norm < 1e-9:
-                    return 0.0, 0.0, 1.0
-                return rx/norm, ry/norm, rz/norm
-
-    # Calibration: Using .cal B-Spline Mesh — equirectangular used only without a cal path
-    print("[WARN] _unproject_pixel: no .cal calibration active — falling back to equirectangular")
+    # No calibration configured → equirectangular approximation (legacy behaviour)
+    W, H  = float(cfg.image_width), float(cfg.image_height)
     cx    = W / 2.0
     cy    = H / 2.0
     dx    = u - cx
@@ -801,6 +1142,10 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
     os.makedirs(cfg.output_folder, exist_ok=True)
     start_time = time.time()
 
+    # build the Ladybug LUTs up-front so the first detection per camera isn't
+    # blocked by a multi-second spline-evaluation stall.
+    precompute_ladybug_luts(cfg)
+
     # load both LAS files up front so we don't have to reload them per camera.
     # Camera1/2 are left-facing, Camera3/4 are right-facing.
     left_tree  = left_pts  = None
@@ -1202,7 +1547,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                                  f"{m['cam_key']}_{m['image']}"), img)
 
     # ---
-    # Phase 4: export shapefile and JSON for QGIS
+    # Phase 4: export GeoJSON (EPSG:4326, WGS84)
     # ---
     print("[PHASE 4] Exporting results...")
     flat: list[dict] = []

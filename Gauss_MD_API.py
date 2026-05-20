@@ -450,8 +450,8 @@ def generate_final_export(req: FinalExportRequest):
 
     return {"status": "success"}
 
-@app.get("/api/download_shapefile")
-def download_shapefile(session_id: str):
+@app.get("/api/download_geojson")
+def download_geojson(session_id: str):
     st = load_state(session_id)
     target_dir = st["current_output_dir"]
     base_name = "Export_Camine"
