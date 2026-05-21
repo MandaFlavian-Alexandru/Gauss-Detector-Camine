@@ -28,6 +28,33 @@ logger = logging.getLogger("Gauss_FastAPI")
 # only these two values are accepted for execution_mode
 ALLOWED_EXECUTION_MODES = {"parallel", "sequential"}
 
+# Path to the Ladybug factory calibration file. The backend uses this to build
+# the B-spline LUT that maps each pixel to a unit ray vector — without it, the
+# backend silently falls back to a pinhole approximation that drifts at the
+# image edges. The path is resolved at import time so the API fails fast with
+# a clear error if the file is missing, rather than every detection run quietly
+# running uncalibrated.
+LADYBUG_CAL_PATH = os.path.abspath("ladybug15295546.cal")
+
+
+def _require_ladybug_cal() -> str:
+    """
+    Returns the absolute path to the Ladybug .cal file. Raises HTTPException(500)
+    with an actionable message if the file is missing — better to fail loudly at
+    the start of a detection run than to silently produce drifted coordinates.
+    """
+    if not os.path.isfile(LADYBUG_CAL_PATH):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Ladybug calibration file not found at {LADYBUG_CAL_PATH}. "
+                "The detector requires this file for accurate ray geometry. "
+                "Place ladybug15295546.cal in the working directory and retry."
+            ),
+        )
+    return LADYBUG_CAL_PATH
+
+
 def _validate_session_id(session_id: str) -> str:
     """
     Checks that a session_id is a valid UUID before we use it to build file paths.
@@ -157,6 +184,7 @@ def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf
         sys.executable, os.path.abspath("Gauss_MD_Backend.py"),
         "--folder",     folder_path,
         "--las_folder", las_folder_path,
+        "--cal",        _require_ladybug_cal(),
         "--conf",       str(round(conf / 100.0, 4)),
         "--cluster",    str(round(cluster, 4)),
         "--batch",      str(int(batch_size)),
